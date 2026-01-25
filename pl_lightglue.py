@@ -68,6 +68,7 @@ class PL_LightGlue(pl.LightningModule):
         
         # 损失权重
         self.nll_weight = 1.0
+        self.vessel_loss_weight = 1.0 # 默认权重，可通过 CurriculumScheduler 动态调整
 
     def configure_optimizers(self):
         """配置优化器"""
@@ -170,10 +171,15 @@ class PL_LightGlue(pl.LightningModule):
         
         return matches_gt
 
-    def _compute_loss(self, outputs, kpts0, kpts1, T_0to1):
+    def _compute_loss(self, outputs, kpts0, kpts1, T_0to1, mask0=None):
         """
         计算负对数似然损失 (Negative Log Likelihood Loss)
         目标是让 LightGlue 预测的匹配概率分布接近几何真值分布。
+        
+        Args:
+            mask0: [B, H, W] (Optional) Fix图像的血管掩码。
+                   如果提供且 self.vessel_loss_weight > 1.0，
+                   则对落在掩码内的关键点赋予更高的Loss权重。
         """
         # 获取 LightGlue 输出的对数赋值矩阵 (Log Assignment Matrix)
         # 形状: [B, M+1, N+1]，最后一列/行代表“无匹配”(Dustbin)
@@ -191,12 +197,61 @@ class PL_LightGlue(pl.LightningModule):
         targets = matches_gt.clone()
         targets[targets == -1] = N
         
+        # 准备 Loss 权重
+        weights = None
+        current_vessel_weight = getattr(self, 'vessel_loss_weight', 1.0)
+        
+        if mask0 is not None and current_vessel_weight > 1.001:
+            # 计算每个关键点的权重
+            # kpts0: [B, M, 2] (x, y) 坐标，范围是像素坐标
+            
+            # 我们需要从 mask0 [B, 1, H, W] 或 [B, H, W] 中采样
+            if mask0.dim() == 3:
+                mask0 = mask0.unsqueeze(1) # [B, 1, H, W]
+                
+            # grid_sample 需要归一化坐标 [-1, 1]
+            H, W = mask0.shape[2], mask0.shape[3]
+            
+            # Normalize kpts to [-1, 1] for grid_sample
+            kpts0_norm = kpts0.clone()
+            kpts0_norm[..., 0] = 2.0 * kpts0_norm[..., 0] / (W - 1) - 1.0
+            kpts0_norm[..., 1] = 2.0 * kpts0_norm[..., 1] / (H - 1) - 1.0
+            
+            # grid_sample expects [B, H_grid, W_grid, 2]
+            # 我们把 M 个点看作 [B, 1, M, 2] 的网格
+            grid = kpts0_norm.unsqueeze(1) 
+            
+            # 采样: [B, 1, 1, M]
+            sampled_mask = F.grid_sample(mask0, grid, mode='nearest', align_corners=True)
+            
+            # [B, M]
+            in_vessel = sampled_mask.squeeze(1).squeeze(1) > 0.5
+            
+            # 构建权重向量: 默认为 1.0，血管内为 current_vessel_weight
+            weights = torch.ones_like(in_vessel, dtype=torch.float32)
+            weights[in_vessel] = current_vessel_weight
+            
+            # 日志记录 (可选)
+            # if self.global_step % 100 == 0:
+            #     print(f"DEBUG: Vessel points ratio: {in_vessel.float().mean():.3f}, Weight: {current_vessel_weight}")
+
         # 计算 NLL Loss
         # 我们只看前 M 行 (对应 image0 的所有关键点)
         # scores[:, :M, :] 形状为 [B, M, N+1]
-        # targets 形状为 [B, M]，包含了每个关键点应该匹配到的 image1 索引 (或 N)
-        # F.nll_loss 需要 (N, C, ...) 格式的输入，所以我们需要转置 scores
-        loss = F.nll_loss(scores[:, :M, :].transpose(1, 2), targets)
+        # targets 形状为 [B, M]
+        
+        # F.nll_loss 不支持 per-sample weight (class weight 是针对类别的)
+        # 所以我们需要手动实现带权重的 NLL
+        
+        # 1. 取出目标类别的 log_prob
+        # gather index 需要扩维成 [B, M, 1]
+        target_log_probs = torch.gather(scores[:, :M, :], 2, targets.unsqueeze(2)).squeeze(2) # [B, M]
+        
+        # 2. 应用权重
+        if weights is not None:
+            loss = -(target_log_probs * weights).mean()
+        else:
+            loss = -target_log_probs.mean()
         
         return loss
 
@@ -215,7 +270,9 @@ class PL_LightGlue(pl.LightningModule):
         
         # 3. 计算损失
         # 使用 dataset 提供的 T_0to1 (真值变换) 来监督
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        # 尝试获取 mask0 (如果 dataset 提供了血管掩码)
+        mask0 = batch.get('vessel_mask0', None)
+        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'], mask0=mask0)
         
         # 记录日志
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -228,8 +285,8 @@ class PL_LightGlue(pl.LightningModule):
         """
         outputs = self(batch)
         
-        # 计算验证损失
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        # 计算验证损失 (验证阶段通常不加权，或者保持一致。这里为了指标可比性，暂不加权/或加权也可，但通常无需Curriculum)
+        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'], mask0=None)
         
         # 确定验证集状态
         # 为了避免 "called twice with different arguments" 错误，我们统一参数配置

@@ -431,6 +431,44 @@ class DelayedEarlyStopping(EarlyStopping):
             return
         super().on_train_epoch_end(trainer, pl_module)
 
+# --- Curriculum Learning Scheduler ---
+class CurriculumScheduler(pl.Callback):
+    """
+    基于 Epoch 的课程学习调度器
+    负责动态调整 PL_LightGlue 模型的 vessel_loss_weight
+    
+    Phase 1 (Teaching): Epoch 0-20 -> Weight 10.0 (强迫关注血管)
+    Phase 2 (Weaning):  Epoch 20-50 -> Weight 10.0 -> 1.0 (线性衰减)
+    Phase 3 (Independence): Epoch 50+ -> Weight 1.0 (正常模式)
+    """
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        
+        # 定义阶段参数
+        TEACHING_END = 20
+        WEANING_END = 50
+        MAX_WEIGHT = 10.0
+        MIN_WEIGHT = 1.0
+        
+        if epoch < TEACHING_END:
+            # 教学期
+            current_weight = MAX_WEIGHT
+        elif epoch < WEANING_END:
+            # 断奶期 (线性插值)
+            progress = (epoch - TEACHING_END) / (WEANING_END - TEACHING_END)
+            current_weight = MAX_WEIGHT - progress * (MAX_WEIGHT - MIN_WEIGHT)
+        else:
+            # 独立期
+            current_weight = MIN_WEIGHT
+            
+        # 注入模型
+        if hasattr(pl_module, 'vessel_loss_weight'):
+            pl_module.vessel_loss_weight = current_weight
+            
+            # 记录日志
+            pl_module.log('train/vessel_weight', current_weight, on_epoch=True, prog_bar=True)
+            logger.info(f"Epoch {epoch}: Adjusted vessel_loss_weight to {current_weight:.2f}")
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='cffa', choices=['cffa', 'cfoct', 'octfa', 'cfocta'], help='配准模式')
@@ -465,8 +503,11 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval='step')
     # 早停策略 (前50 epoch 不停，之后如果 MACE 在 10 epoch 内不下降则停)
     early_stop_callback = DelayedEarlyStopping(
-        start_epoch=100, monitor='val_mace', patience=10, mode='min', min_delta=0.01, check_finite=False
+        start_epoch=100 monitor='val_mace', patience=10, mode='min', min_delta=0.01, check_finite=False
     )
+    
+    # 课程学习调度器
+    curriculum_callback = CurriculumScheduler()
     
     # 解析 GPU 配置
     # PL 2.0 推荐使用 accelerator="gpu", devices=[...]
@@ -487,7 +528,7 @@ def main():
         devices=devices,
         check_val_every_n_epoch=1, # 每 epoch 验证一次，确保 LR Scheduler 有指标可查
         num_sanity_val_steps=2,    # 训练前跑2个 batch 检查流程
-        callbacks=[val_callback, lr_monitor, early_stop_callback],
+        callbacks=[val_callback, lr_monitor, early_stop_callback, curriculum_callback],
         logger=TensorBoardLogger('logs/tb_logs', name=args.name),
         # replace_sampler_ddp=False, # PL 2.0 不需要显式设置，除非有特殊需求
         strategy="ddp_find_unused_parameters_true" if len(devices) > 1 and isinstance(devices, list) else "auto"
