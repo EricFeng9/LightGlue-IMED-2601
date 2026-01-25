@@ -512,7 +512,7 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval='step')
     # 早停策略 (前50 epoch 不停，之后如果 MACE 在 10 epoch 内不下降则停)
     early_stop_callback = DelayedEarlyStopping(
-        start_epoch=100 monitor='val_mace', patience=10, mode='min', min_delta=0.01, check_finite=False
+        start_epoch=100,monitor='val_mace', patience=10, mode='min', min_delta=0.01, check_finite=False
     )
     
     # 课程学习调度器
