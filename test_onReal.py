@@ -144,7 +144,7 @@ def main():
     parser = argparse.ArgumentParser(description="LightGlue Multi-Modal Verification Script")
     parser.add_argument('--mode', type=str, required=True, choices=['cffa', 'cfoct', 'octfa', 'cfocta'])
     parser.add_argument('--name', type=str, required=True, help='Experiment name (folder in results/)')
-    parser.add_argument('--savedir', type=str, default='test_run')
+    parser.add_argument('--save_dir', type=str, default='test_run')
     parser.add_argument('--gpu', type=str, default='0')
     args = parser.parse_args()
 
@@ -157,7 +157,7 @@ def main():
             logger.error(f"Checkpoint not found at: {ckpt_path}")
             return
 
-    save_root = Path(f"test_results/{args.mode}/{args.savedir}")
+    save_root = Path(f"test_results/{args.mode}/{args.save_dir}")
     save_root.mkdir(parents=True, exist_ok=True)
     
     logger.add(save_root / "log.txt", rotation="10 MB")
@@ -279,6 +279,7 @@ def main():
         metrics = calculate_metrics(
             img_origin=img0_np, img_result=img1_result,
             mkpts0=mkpts0, mkpts1=mkpts1,
+            kpts0=kpts0.cpu().numpy(), kpts1=kpts1.cpu().numpy(),
             ctrl_pts0=ctrl_pts0, ctrl_pts1=ctrl_pts1,
             H_gt=H_gt
         )
@@ -287,28 +288,12 @@ def main():
         mace = compute_corner_error(H_est, H_gt, h, w)
         metrics['MACE'] = mace
         
-        # Add MSE (from train_lightglue logic)
-        # MSE is calculated between warped moving (result) and fix (img0)
-        # Note: In train script, it compares warped result with 'image1_gt' (which is aligned moving)
-        # Here H_gt aligns moving to fix, so img1_origin is the perfectly aligned moving image.
-        # But commonly MSE is computed against the Fixed Image (img0) if modalities match,
-        # OR against the Aligned Moving Image (img1_origin) if we want registration accuracy alone.
-        # Let's check train_lightglue_onGen_v2.py:
-        # mse = np.mean((img1_result - img1_gt) ** 2)
-        # In real dataset wrapper of train script: image1_gt = moving_gray (which seems to be moving image?)
-        # Wait, RealDatasetWrapper in train script:
-        # moving_gt_tensor = (moving_gt_tensor + 1) / 2
-        # T_0to1 = ...
-        # Actually in real datasets, we often don't have a perfectly aligned pixel-wise ground truth image if modalities differ heavily
-        # unless it is pre-registered.
-        # But assuming `calculate_metrics` handles some logic, let's also compute simple MSE.
-        
         # Standard MSE between result and fixed
         mse_pixel = np.mean(((img1_result / 255.0) - (img0_np / 255.0)) ** 2)
         metrics['MSE'] = mse_pixel
 
         all_metrics.append(metrics)
-        logger.info(f"Sample: {pair_name} | MACE: {mace:.4f} | MeanErr: {metrics['mean_error']:.2f}")
+        logger.info(f"Sample: {pair_name} | MACE: {mace:.4f} | ME: {metrics['mean_error']:.2f} | MAE: {metrics['max_error']:.2f} | Rep: {metrics['Rep']:.4f} | MIR: {metrics['MIR']:.4f}")
 
     # 6. Summary
     if all_metrics:
@@ -324,11 +309,21 @@ def main():
         if success_count > 0:
             avg_mace = np.mean([m['MACE'] for m in valid_metrics if np.isfinite(m['MACE'])])
             avg_mse = np.mean([m['MSE'] for m in valid_metrics if np.isfinite(m['MSE'])])
-            avg_mean_err = np.mean([m['mean_error'] for m in valid_metrics])
+            avg_me = np.mean([m['mean_error'] for m in valid_metrics])
+            avg_mae = np.mean([m['max_error'] for m in valid_metrics])
+            avg_sr_me = np.mean([m['SR_ME'] for m in valid_metrics])
+            avg_sr_mae = np.mean([m['SR_MAE'] for m in valid_metrics])
+            avg_rep = np.mean([m['Rep'] for m in valid_metrics])
+            avg_mir = np.mean([m['MIR'] for m in valid_metrics])
             
-            logger.info(f"  Avg MACE: {avg_mace:.4f}")
-            logger.info(f"  Avg MSE:  {avg_mse:.4f}")
-            logger.info(f"  Avg MeanErr: {avg_mean_err:.4f}")
+            logger.info(f"  Avg MACE:    {avg_mace:.4f}")
+            logger.info(f"  Avg MSE:     {avg_mse:.4f}")
+            logger.info(f"  Avg ME:      {avg_me:.2f} px")
+            logger.info(f"  Avg MAE:     {avg_mae:.2f} px")
+            logger.info(f"  SR_ME:       {avg_sr_me:.4f}")
+            logger.info(f"  SR_MAE:      {avg_sr_mae:.4f}")
+            logger.info(f"  Repeatability: {avg_rep:.4f}")
+            logger.info(f"  MIR:         {avg_mir:.4f}")
         logger.info("="*30)
 
 if __name__ == "__main__":
