@@ -1,0 +1,9 @@
+MATCHING:
+  descriptor_dim: 256
+  input_dim: 256
+TRAINER:
+  CANONICAL_BS: 4
+  CANONICAL_LR: 0.0001
+  EXP_NAME: lightglue_multimodal
+  PLOT_MODE: evaluation
+  TRUE_LR: 0.0001

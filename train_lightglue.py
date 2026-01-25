@@ -134,7 +134,7 @@ class MultimodalDataModule(pl.LightningDataModule):
             # 训练集：使用基于 FIVES 的生成数据 (MultiModalDataset)
             # 在 Dataset 内部已经应用了随机仿射变换
             self.train_dataset = MultiModalDataset(
-                args.data_root, mode=self.args.mode, split='train', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
+                self.args.data_root, mode=self.args.mode, split='train', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
             
             # 验证集配置
             if self.args.val_on_real:
@@ -152,10 +152,10 @@ class MultimodalDataModule(pl.LightningDataModule):
                 self.val_dataset_real = RealDatasetWrapper(base_dataset)
                 # 同时保留生成数据验证集，仅供参考
                 self.val_dataset_gen = MultiModalDataset(
-                    args.data_root, mode=self.args.mode, split='val', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
+                    self.args.data_root, mode=self.args.mode, split='val', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
             else:
                 self.val_dataset = MultiModalDataset(
-                    args.data_root, mode=self.args.mode, split='val', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
+                    self.args.data_root, mode=self.args.mode, split='val', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
@@ -224,80 +224,126 @@ class MultimodalValidationCallback(Callback):
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_mses = []
         self.epoch_maces = []
+        self.cached_results = [] # 缓存当前 epoch 的结果用于后续绘图
 
     def on_validation_epoch_start(self, trainer, pl_module):
         self.epoch_mses = []
         self.epoch_maces = []
+        self.cached_results = []
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        # 确定保存子目录
-        if trainer.sanity_checking:
-            sub_dir = "step0"
-        else:
-            sub_dir = f"epoch{trainer.current_epoch + 1}"
+        # 判定是否是我们需要忽略指标的“生成数据”
+        is_generated = (self.args.val_on_real and dataloader_idx == 0)
         
-        if self.args.val_on_real:
-            if dataloader_idx == 0:
-                epoch_dir = self.result_dir / f"{sub_dir}_generated" # 生成数据结果
-            else:
-                epoch_dir = self.result_dir / f"{sub_dir}_real" # 真实数据结果
+        if is_generated:
+            # 生成数据：不准算指标！浪费时间！直接给空值
+            batch_mses, batch_maces = [], []
         else:
-            epoch_dir = self.result_dir / sub_dir
-            
-        epoch_dir.mkdir(parents=True, exist_ok=True)
-        # 保存 Batch 结果并获取指标
-        batch_mses, batch_maces = self._save_batch_results(trainer, pl_module, batch, outputs, epoch_dir)
-        
-        # 仅收集真实数据集的指标用于模型评估
-        if self.args.val_on_real and dataloader_idx == 1:
+            # 真实数据（或唯一验证集）：认真计算指标
+            batch_mses, batch_maces = self._compute_batch_metrics(outputs, batch)
             self.epoch_mses.extend(batch_mses)
             self.epoch_maces.extend(batch_maces)
-        elif not self.args.val_on_real:
-            self.epoch_mses.extend(batch_mses)
-            self.epoch_maces.extend(batch_maces)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch + 1
-        metrics = trainer.callback_metrics
-        logger.info(f"Epoch {epoch} finished. Metrics: {metrics}")
+        
+        # 缓存数据（无论哪种数据都要缓存，因为用户要看图）
+        self.cached_results.append({
+            'batch': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()},
+            'outputs': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()} if isinstance(outputs, dict) else outputs,
+            'dataloader_idx': dataloader_idx,
+            'mses': batch_mses,
+            'maces': batch_maces
+        })
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        # 如果没有指标或只是 Sanity Check，不执行保存逻辑
         if not self.epoch_mses or trainer.sanity_checking:
+            # Sanity check 还是要画一下图确认流程正常
+            if trainer.sanity_checking and self.cached_results:
+                self._plot_cached_results(trainer, "step0")
             return
             
         epoch = trainer.current_epoch + 1
         avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
-        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else float('inf')
+        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces)
         
-        logger.info(f"Epoch {epoch} Validation: MSE (Real): {avg_mse:.6f}, MACE (Real): {avg_mace:.4f}")
+        logger.info(f"Epoch {epoch} Validation: MSE: {avg_mse:.6f}, MACE: {avg_mace:.4f}")
         
-        # 记录到 TensorBoard
         pl_module.log("val_mse", avg_mse, on_epoch=True)
         pl_module.log("val_mace", avg_mace, on_epoch=True)
         
+        # 判定是否需要可视化
+        is_best = avg_mace < self.best_val
+        is_plot_epoch = (epoch % self.args.plot_every_n_epoch == 0)
+        
+        if is_best or is_plot_epoch:
+            sub_dir = f"epoch{epoch}"
+            if is_best:
+                sub_dir += "_BEST"
+            self._plot_cached_results(trainer, sub_dir)
+
         # 保存最新模型
         latest_path = self.result_dir / "latest_checkpoint"
         latest_path.mkdir(exist_ok=True)
         trainer.save_checkpoint(latest_path / "model.ckpt")
         
-        # 保存最优模型 (基于 MACE)
-        if avg_mace < self.best_val:
+        # 只要产生更好的 MACE 就保存最优模型
+        if is_best:
             self.best_val = avg_mace
             best_path = self.result_dir / "best_checkpoint"
             best_path.mkdir(exist_ok=True)
             trainer.save_checkpoint(best_path / "model.ckpt")
             with open(best_path / "log.txt", "w") as f:
                 f.write(f"Epoch: {epoch}\nBest MACE: {avg_mace:.6f}\nBest MSE: {avg_mse:.6f}")
+            logger.info(f"New Best Model Saved at Epoch {epoch} with MACE {avg_mace:.4f}")
 
-    def _save_batch_results(self, trainer, pl_module, batch, outputs, epoch_dir):
-        """保存单个 Batch 的所有样本可视化结果"""
+    def _compute_batch_metrics(self, outputs, batch):
+        """仅计算指标"""
         batch_size = batch['image0'].shape[0]
         mses, maces = [], []
+        H_ests = outputs['H_est']
+        Ts_gt = batch['T_0to1'].cpu().numpy()
         
-        H_ests = outputs['H_est'] # 估计的单应矩阵
-        Ts_gt = batch['T_0to1'].cpu().numpy() # 真值变换矩阵
-        
+        for i in range(batch_size):
+            img0 = batch['image0'][i, 0].cpu().numpy()
+            ref_key = 'image1_gt' if 'image1_gt' in batch else 'image1_origin'
+            img1_gt = batch[ref_key][i, 0].cpu().numpy()
+            H_est = H_ests[i]
+            
+            # Warp (用于计算 MSE)
+            h, w = img0.shape
+            try:
+                H_inv = np.linalg.inv(H_est)
+                img1_result = cv2.warpPerspective(batch['image1'][i, 0].cpu().numpy(), H_inv, (w, h))
+                mse = np.mean((img1_result - img1_gt) ** 2)
+            except:
+                mse = 1.0
+            
+            mace = compute_corner_error(H_est, Ts_gt[i], h, w)
+            mses.append(mse)
+            maces.append(mace)
+        return mses, maces
+
+    def _plot_cached_results(self, trainer, sub_dir_name):
+        """执行绘图操作"""
+        logger.info(f"Plotting visualization for {sub_dir_name}...")
+        for res in self.cached_results:
+            batch = res['batch']
+            outputs = res['outputs']
+            dl_idx = res['dataloader_idx']
+            
+            if self.args.val_on_real:
+                suffix = "_generated" if dl_idx == 0 else "_real"
+            else:
+                suffix = ""
+            
+            epoch_dir = self.result_dir / f"{sub_dir_name}{suffix}"
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 复用之前的绘图逻辑
+            self._save_visualizations(batch, outputs, epoch_dir)
+
+    def _save_visualizations(self, batch, outputs, epoch_dir):
+        """真正的绘图和写磁盘操作"""
+        batch_size = batch['image0'].shape[0]
+        H_ests = outputs['H_est']
         pair_names0 = batch['pair_names'][0]
         pair_names1 = batch['pair_names'][1]
 
@@ -306,59 +352,39 @@ class MultimodalValidationCallback(Callback):
             save_path = epoch_dir / sample_name
             save_path.mkdir(parents=True, exist_ok=True)
             
-            # 转为 numpy image
-            img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            # 获取 GT 对齐后的图 (或 Origin)
-            ref_key = 'image1_gt' if 'image1_gt' in batch else 'image1_origin'
-            img1_gt = (batch[ref_key][i, 0].cpu().numpy() * 255).astype(np.uint8)
-
+            img0 = (batch['image0'][i, 0].numpy() * 255).astype(np.uint8)
+            img1 = (batch['image1'][i, 0].numpy() * 255).astype(np.uint8)
             H_est = H_ests[i]
-            
-            # 应用单应变换 (Warp)
             h, w = img0.shape
+            
             try:
                 H_inv = np.linalg.inv(H_est)
-                # 将 Moving 变换回 Fix 的视角
                 img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
             except:
                 img1_result = img1.copy()
             
-            # 计算 MSE
-            mse = np.mean(((img1_result / 255.0) - (img1_gt / 255.0)) ** 2)
-            mses.append(mse)
-            
-            # 计算 MACE
-            H_gt = Ts_gt[i]
-            mace = compute_corner_error(H_est, H_gt, h, w)
-            maces.append(mace)
-            
-            # 保存图像
             cv2.imwrite(str(save_path / "fix.png"), img0)
             cv2.imwrite(str(save_path / "moving.png"), img1)
             cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
             cv2.imwrite(str(save_path / "chessboard.png"), create_chessboard(img1_result, img0))
             
-            # 绘制匹配连线图
+            fig = None
             try:
                 m0 = outputs['matches0'][i]
                 valid = m0 > -1
-                m_indices_0 = torch.where(valid)[0]
-                m_indices_1 = m0[valid]
-                kpts0 = outputs['kpts0'][i].cpu().numpy()
-                kpts1 = outputs['kpts1'][i].cpu().numpy()
+                m_indices_0 = torch.where(valid)[0].numpy()
+                m_indices_1 = m0[valid].numpy()
+                kpts0 = outputs['kpts0'][i].numpy()
+                kpts1 = outputs['kpts1'][i].numpy()
                 
-                # 使用 Matplotlib 绘制
                 fig = plt.figure(figsize=(10, 4))
-                ax = fig.add_subplot(111)
                 viz2d.plot_images([img0, img1], titles=['Fix', 'Moving'])
                 viz2d.plot_matches(kpts0[m_indices_0], kpts1[m_indices_1], color='lime', lw=0.5)
                 plt.savefig(str(save_path / "matches.png"), bbox_inches='tight')
-                plt.close(fig)
             except Exception as e:
-                logger.warning(f"Failed to plot matches: {e}")
-
-        return mses, maces
+                pass
+            finally:
+                if fig is not None: plt.close(fig)
 
 # --- 自定义早停 ---
 class DelayedEarlyStopping(EarlyStopping):
@@ -383,7 +409,8 @@ def parse_args():
     parser.add_argument('--data_root', type=str, default="data/FIVES_extract_v2")
     
     parser.add_argument('--max_epochs', type=int, default=500)
-    parser.add_argument('--gpus', type=str, default='1')
+    parser.add_argument('--gpus', type=str, default='0')
+    parser.add_argument('--plot_every_n_epoch', type=int, default=5, help='每隔多少 epoch 保存一次可视化结果')
     return parser.parse_args()
 
 def main():
@@ -423,7 +450,7 @@ def main():
         max_epochs=args.max_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=devices,
-        check_val_every_n_epoch=5, # 每5 epoch验证一次
+        check_val_every_n_epoch=1, # 每 epoch 验证一次，确保 LR Scheduler 有指标可查
         num_sanity_val_steps=2,    # 训练前跑2个 batch 检查流程
         callbacks=[val_callback, lr_monitor, early_stop_callback],
         logger=TensorBoardLogger('logs/tb_logs', name=args.name),

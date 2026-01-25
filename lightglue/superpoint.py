@@ -220,6 +220,32 @@ class SuperPoint(Extractor):
             for k, d in zip(keypoints, descriptors)
         ]
 
+        device = image.device
+        if b > 1:
+            # Pad keypoints and scores to have the same number of points
+            max_kps = max(len(k) for k in keypoints)
+            # Ensure at least one keypoint to avoid empty tensors
+            max_kps = max(max_kps, 1)
+
+            padded_keypoints = torch.zeros((b, max_kps, 2), device=device)
+            padded_scores = torch.zeros((b, max_kps), device=device)
+            padded_descriptors = torch.zeros(
+                (b, self.conf.descriptor_dim, max_kps), device=device
+            )
+
+            for i in range(b):
+                n = len(keypoints[i])
+                if n > 0:
+                    padded_keypoints[i, :n] = keypoints[i]
+                    padded_scores[i, :n] = scores[i]
+                    padded_descriptors[i, :, :n] = descriptors[i]
+
+            return {
+                "keypoints": padded_keypoints,
+                "keypoint_scores": padded_scores,
+                "descriptors": padded_descriptors.transpose(-1, -2).contiguous(),
+            }
+
         return {
             "keypoints": torch.stack(keypoints, 0),
             "keypoint_scores": torch.stack(scores, 0),

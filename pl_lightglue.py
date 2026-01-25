@@ -102,9 +102,14 @@ class PL_LightGlue(pl.LightningModule):
                 feats0 = self.extractor({'image': batch['image0']})
                 feats1 = self.extractor({'image': batch['image1']})
                 # 将提取的特征存回 batch，方便后续使用
-                batch = {**batch, 
-                         'keypoints0': feats0['keypoints'], 'descriptors0': feats0['descriptors'], 'scores0': feats0['scores'],
-                         'keypoints1': feats1['keypoints'], 'descriptors1': feats1['descriptors'], 'scores1': feats1['scores']}
+                batch.update({
+                    'keypoints0': feats0['keypoints'], 
+                    'descriptors0': feats0['descriptors'], 
+                    'scores0': feats0['keypoint_scores'],
+                    'keypoints1': feats1['keypoints'], 
+                    'descriptors1': feats1['descriptors'], 
+                    'scores1': feats1['keypoint_scores']
+                })
         
         # 整理成 LightGlue 期望的输入格式
         data = {
@@ -222,6 +227,23 @@ class PL_LightGlue(pl.LightningModule):
         计算估计的单应矩阵 H_est，供回调函数计算 MACE/MSE 指标
         """
         outputs = self(batch)
+        
+        # 计算验证损失
+        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        
+        # 确定验证集状态
+        num_dataloaders = getattr(self.trainer, 'num_val_dataloaders', 1)
+        
+        if num_dataloaders > 1:
+            if dataloader_idx == 0:
+                # 生成数据：仅记录用于观察，不参与核心指标 val_loss
+                self.log('val_loss_gen', loss, on_step=False, on_epoch=True, prog_bar=False, add_dataloader_idx=False)
+            else:
+                # 真实数据：这才是唯一的真神指标，供 Scheduler 监控
+                self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
+        else:
+            # 只有一个验证集时（比如关闭了真实数据验证），必须叫 val_loss 否则程序会崩
+            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
         
         # 获取预测的匹配对
         matches0 = outputs['matches0'] # [B, M], image0 中每个点在 image1 中的匹配索引
