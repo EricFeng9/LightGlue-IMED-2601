@@ -319,6 +319,9 @@ class MultimodalValidationCallback(Callback):
         H_ests = outputs['H_est']
         pair_names0 = batch['pair_names'][0]
         pair_names1 = batch['pair_names'][1]
+        
+        # 提取关键点 (如果存在)
+        has_kpts = 'kpts0' in outputs and 'kpts1' in outputs
 
         for i in range(batch_size):
             sample_name = f"{Path(pair_names0[i]).stem}_vs_{Path(pair_names1[i]).stem}"
@@ -341,14 +344,32 @@ class MultimodalValidationCallback(Callback):
             cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
             cv2.imwrite(str(save_path / "chessboard.png"), create_chessboard(img1_result, img0))
             
+            # --- 新增：可视化特征提取点 ---
+            if has_kpts:
+                try:
+                    kpts0 = outputs['kpts0'][i].numpy()
+                    kpts1 = outputs['kpts1'][i].numpy()
+                    
+                    fig_kpts = plt.figure(figsize=(10, 4))
+                    viz2d.plot_images([img0, img1], titles=['Fix Keypoints', 'Moving Keypoints'])
+                    viz2d.plot_keypoints([kpts0, kpts1], colors='red', ps=2)
+                    plt.savefig(str(save_path / "keypoints.png"), bbox_inches='tight')
+                    plt.close(fig_kpts)
+                except Exception as e:
+                    logger.warning(f"Failed to plot keypoints for {sample_name}: {e}")
+            
+            # --- 原有：可视化匹配 ---
             fig = None
             try:
                 m0 = outputs['matches0'][i]
                 valid = m0 > -1
                 m_indices_0 = torch.where(valid)[0].numpy()
                 m_indices_1 = m0[valid].numpy()
-                kpts0 = outputs['kpts0'][i].numpy()
-                kpts1 = outputs['kpts1'][i].numpy()
+                
+                # 如果前面没取 kpts，这里取一下
+                if 'kpts0' not in locals():
+                    kpts0 = outputs['kpts0'][i].numpy()
+                    kpts1 = outputs['kpts1'][i].numpy()
                 
                 fig = plt.figure(figsize=(10, 4))
                 viz2d.plot_images([img0, img1], titles=['Fix', 'Moving'])
