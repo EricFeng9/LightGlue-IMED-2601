@@ -488,6 +488,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # --- 配置日志保存 ---
+    # 确保实验结果目录存在
+    result_dir = Path(f"results/{args.mode}/{args.name}")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 添加文件日志 (追加模式)
+    logger.add(result_dir / "train_log.txt", rotation="10 MB", level="INFO", mode="a")
+
     config = get_default_config()
     
     pl.seed_everything(66)
