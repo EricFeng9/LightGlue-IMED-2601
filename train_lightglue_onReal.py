@@ -158,25 +158,47 @@ class MultimodalDataModule(pl.LightningDataModule):
         return torch.utils.data.DataLoader(self.val_dataset, shuffle=False, **self.loader_params)
 
 # --- 工具函数 ---
-def compute_corner_error(H_est, H_gt, height, width):
-    """计算角点平均误差 (MACE)"""
-    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
-    corners_homo = np.concatenate([corners, np.ones((4, 1), dtype=np.float32)], axis=1)
+def compute_tre(H_est, H_gt, height, width, grid_size=10):
+    """
+    计算 Target Registration Error (TRE) 的近似值。
+    由于真实数据集的GT点较少，且 MACE (Corner Error) 在图像边缘容易发散，
+    这里改为计算图像内部 ROI 区域内网格点的平均重投影误差。
+    """
+    # 定义 ROI (Region of Interest) 范围：避开图像边缘 (例如取中心 ~80% 区域)
+    margin_w = width * 0.1
+    margin_h = height * 0.1
     
-    # GT 变换后的角点
-    corners_gt_homo = (H_gt @ corners_homo.T).T
-    corners_gt = corners_gt_homo[:, :2] / (corners_gt_homo[:, 2:] + 1e-6)
+    # 生成网格点
+    x = np.linspace(margin_w, width - margin_w, grid_size)
+    y = np.linspace(margin_h, height - margin_h, grid_size)
+    xv, yv = np.meshgrid(x, y)
     
-    # 预测变换后的角点
-    corners_est_homo = (H_est @ corners_homo.T).T
-    corners_est = corners_est_homo[:, :2] / (corners_est_homo[:, 2:] + 1e-6)
+    # [N, 2]
+    pts = np.stack([xv.flatten(), yv.flatten()], axis=1).astype(np.float32)
+    
+    # 齐次坐标 [N, 3]
+    pts_homo = np.concatenate([pts, np.ones((len(pts), 1), dtype=np.float32)], axis=1)
+    
+    # GT 变换后的点
+    pts_gt_homo = (H_gt @ pts_homo.T).T
+    pts_gt = pts_gt_homo[:, :2] / (pts_gt_homo[:, 2:] + 1e-6)
+    
+    # 预测变换后的点
+    pts_est_homo = (H_est @ pts_homo.T).T
+    pts_est = pts_est_homo[:, :2] / (pts_est_homo[:, 2:] + 1e-6)
     
     try:
-        errors = np.sqrt(np.sum((corners_est - corners_gt)**2, axis=1))
-        mace = np.mean(errors)
+        # 计算每个点的 L2 距离，然后求平均
+        errors = np.sqrt(np.sum((pts_est - pts_gt)**2, axis=1))
+        # 排除极大值 (防止溢出或数值不稳定影响整体)
+        valid_errors = errors[errors < 1000] 
+        if len(valid_errors) > 0:
+            tre = np.mean(valid_errors)
+        else:
+             tre = float('inf')
     except:
-        mace = float('inf')
-    return mace
+        tre = float('inf')
+    return tre
 
 def create_chessboard(img1, img2, grid_size=4):
     """创建棋盘格对比图"""
@@ -210,26 +232,26 @@ class MultimodalValidationCallback(Callback):
         self.result_dir = Path(f"results/{args.mode}/{args.name}")
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_mses = []
-        self.epoch_maces = []
+        self.epoch_tres = []
         self.cached_results = [] # 缓存当前 epoch 的结果用于后续绘图
 
     def on_validation_epoch_start(self, trainer, pl_module):
         self.epoch_mses = []
-        self.epoch_maces = []
+        self.epoch_tres = []
         self.cached_results = []
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         # 真实数据：计算指标
-        batch_mses, batch_maces = self._compute_batch_metrics(outputs, batch)
+        batch_mses, batch_tres = self._compute_batch_metrics(outputs, batch)
         self.epoch_mses.extend(batch_mses)
-        self.epoch_maces.extend(batch_maces)
+        self.epoch_tres.extend(batch_tres)
         
         # 缓存数据
         self.cached_results.append({
             'batch': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()},
             'outputs': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()} if isinstance(outputs, dict) else outputs,
             'mses': batch_mses,
-            'maces': batch_maces
+            'tres': batch_tres
         })
 
     def on_validation_epoch_end(self, trainer, pl_module):
@@ -241,15 +263,15 @@ class MultimodalValidationCallback(Callback):
             
         epoch = trainer.current_epoch + 1
         avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
-        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces)
+        avg_tre = sum(self.epoch_tres) / len(self.epoch_tres)
         
-        logger.info(f"Epoch {epoch} Validation: MSE: {avg_mse:.6f}, MACE: {avg_mace:.4f}")
+        logger.info(f"Epoch {epoch} Validation: MSE: {avg_mse:.6f}, TRE: {avg_tre:.4f}")
         
         pl_module.log("val_mse", avg_mse, on_epoch=True)
-        pl_module.log("val_mace", avg_mace, on_epoch=True)
+        pl_module.log("val_tre", avg_tre, on_epoch=True)
         
         # 判定是否需要可视化
-        is_best = avg_mace < self.best_val
+        is_best = avg_tre < self.best_val
         is_plot_epoch = (epoch % self.args.plot_every_n_epoch == 0)
         
         if is_best or is_plot_epoch:
@@ -263,20 +285,20 @@ class MultimodalValidationCallback(Callback):
         latest_path.mkdir(exist_ok=True)
         trainer.save_checkpoint(latest_path / "model.ckpt")
         
-        # 只要产生更好的 MACE 就保存最优模型
+        # 只要产生更好的 TRE 就保存最优模型
         if is_best:
-            self.best_val = avg_mace
+            self.best_val = avg_tre
             best_path = self.result_dir / "best_checkpoint"
             best_path.mkdir(exist_ok=True)
             trainer.save_checkpoint(best_path / "model.ckpt")
             with open(best_path / "log.txt", "w") as f:
-                f.write(f"Epoch: {epoch}\nBest MACE: {avg_mace:.6f}\nBest MSE: {avg_mse:.6f}")
-            logger.info(f"New Best Model Saved at Epoch {epoch} with MACE {avg_mace:.4f}")
+                f.write(f"Epoch: {epoch}\nBest TRE: {avg_tre:.6f}\nBest MSE: {avg_mse:.6f}")
+            logger.info(f"New Best Model Saved at Epoch {epoch} with TRE {avg_tre:.4f}")
 
     def _compute_batch_metrics(self, outputs, batch):
         """仅计算指标"""
         batch_size = batch['image0'].shape[0]
-        mses, maces = [], []
+        mses, tres = [], []
         H_ests = outputs['H_est']
         Ts_gt = batch['T_0to1'].cpu().numpy()
         
@@ -295,10 +317,10 @@ class MultimodalValidationCallback(Callback):
             except:
                 mse = 1.0
             
-            mace = compute_corner_error(H_est, Ts_gt[i], h, w)
+            tre = compute_tre(H_est, Ts_gt[i], h, w)
             mses.append(mse)
-            maces.append(mace)
-        return mses, maces
+            tres.append(tre)
+        return mses, tres
 
     def _plot_cached_results(self, trainer, sub_dir_name):
         """执行绘图操作"""
@@ -445,9 +467,9 @@ def main():
     val_callback = MultimodalValidationCallback(args)
     # 学习率监控
     lr_monitor = LearningRateMonitor(logging_interval='step')
-    # 早停策略 (前50 epoch 不停，之后如果 MACE 在 10 epoch 内不下降则停)
+    # 早停策略 (前50 epoch 不停，之后如果 TRE 在 20 epoch 内不下降则停)
     early_stop_callback = DelayedEarlyStopping(
-        start_epoch=100, monitor='val_mace', patience=10, mode='min', min_delta=0.01, check_finite=False
+        start_epoch=100, monitor='val_tre', patience=20, mode='min', min_delta=0.01, check_finite=False
     )
     
     # 解析 GPU 配置
