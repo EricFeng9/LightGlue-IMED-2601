@@ -382,8 +382,8 @@ def parse_args():
     parser.add_argument('--val_on_real', action='store_true', default=True, help='是否在真实数据集上验证')
     parser.add_argument('--data_root', type=str, default="data/FIVES_extract_v2")
     
-    parser = pl.Trainer.add_argparse_args(parser)
-    parser.set_defaults(max_epochs=500, gpus='1')
+    parser.add_argument('--max_epochs', type=int, default=500)
+    parser.add_argument('--gpus', type=str, default='1')
     return parser.parse_args()
 
 def main():
@@ -406,15 +406,29 @@ def main():
         start_epoch=100, monitor='val_mace', patience=10, mode='min', min_delta=0.01
     )
     
+    # 解析 GPU 配置
+    # PL 2.0 推荐使用 accelerator="gpu", devices=[...]
+    # 为了兼容以前的用法 (gpus='1' 或 gpus='0,1') 这里的简单处理：
+    if ',' in args.gpus:
+        devices = [int(x) for x in args.gpus.split(',')]
+    else:
+        try:
+            devices = [int(args.gpus)]
+        except ValueError:
+             # 如果传入的是 "auto" 或者其他非数字
+             devices = "auto"
+
     # Trainer
-    trainer = pl.Trainer.from_argparse_args(
-        args,
-        min_epochs=20,
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=devices,
         check_val_every_n_epoch=5, # 每5 epoch验证一次
         num_sanity_val_steps=2,    # 训练前跑2个 batch 检查流程
         callbacks=[val_callback, lr_monitor, early_stop_callback],
         logger=TensorBoardLogger('logs/tb_logs', name=args.name),
-        replace_sampler_ddp=False,
+        # replace_sampler_ddp=False, # PL 2.0 不需要显式设置，除非有特殊需求
+        strategy="ddp_find_unused_parameters_true" if len(devices) > 1 and isinstance(devices, list) else "auto"
     )
     
     logger.info(f"Starting training: {args.name}")
