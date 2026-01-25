@@ -12,6 +12,18 @@ from gen_data_enhance import apply_domain_randomization
 # 注意：我们这里不直接导入 src 中的绘图工具，因为 src 目录可能缺失
 # 可视化逻辑将在 train_lightglue.py 的 Validation Callback 中处理
 
+import types
+
+def simple_namespace_to_dict(obj):
+    if isinstance(obj, types.SimpleNamespace):
+        return {k: simple_namespace_to_dict(v) for k, v in vars(obj).items()}
+    elif isinstance(obj, dict):
+        return {k: simple_namespace_to_dict(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [simple_namespace_to_dict(v) for v in obj]
+    else:
+        return obj
+
 class PL_LightGlue(pl.LightningModule):
     """
     LightGlue 的 PyTorch Lightning 封装类，用于训练。
@@ -29,7 +41,7 @@ class PL_LightGlue(pl.LightningModule):
         """
         super().__init__()
         self.config = config
-        self.save_hyperparameters(config)
+        self.save_hyperparameters(simple_namespace_to_dict(config))
         
         # 1. 特征提取器 (Feature Extractor) - 使用 SuperPoint
         # 注意：这里我们使用 .eval() 并冻结参数，因为我们只微调 LightGlue 的匹配逻辑
