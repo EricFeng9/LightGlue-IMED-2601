@@ -1,0 +1,8 @@
+我现在在做一个课题，目标是目标是基于我们已有的生成数据集（结构完全相同且对齐的cf-oct-fa图像对）训练出一个支持cf-fa，cf-oct（cf均为fix）的多模态配准模型。我们目前在用fractMorph模型进行2D化改造后的模型，但是fractMorph2D只能针对一些微小血管形变进行对齐和修复，但是针对真实情况不对齐图像中出现的血管大尺度旋转（如15 30度的旋转角度）、大的位置偏移的情况下配准效果较差，1是原先的逐像素点移动的模式很差2是我们修改成让模型直接预测放射参数，效果也很差，几乎不收敛。我现在的想法是改造Lightglue，学习cf图像和oct/fa图像之间的关键点匹配，然后利用这些匹配出来的关键点计算放射矩阵，对跨模态图像进行配准。
+多模态数据集data\FIVES_extract_v2\FIVES_extract_v2.py
+真实数据集：
+data\operation_pre_filtered_cffa\operation_pre_filtered_cffa_dataset.py
+data\operation_pre_filtered_cfoct\operation_pre_filtered_cfoct_dataset.py
+data\operation_pre_filtered_octfa\operation_pre_filtered_octfa_dataset.py
+
+

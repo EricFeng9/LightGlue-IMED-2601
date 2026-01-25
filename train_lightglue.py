@@ -1,0 +1,424 @@
+
+import sys
+import os
+import matplotlib
+matplotlib.use('Agg') # 强制使用非交互式后端，防止多线程绘图报错
+import matplotlib.pyplot as plt
+import argparse
+import pprint
+from pathlib import Path
+from loguru import logger
+import cv2
+import numpy as np
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.utilities import rank_zero_only
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping
+from pytorch_lightning.plugins import DDPPlugin
+from types import SimpleNamespace
+import logging
+
+# 导入本地实现的模块
+from pl_lightglue import PL_LightGlue
+from data.FIVES_extract_v2.FIVES_extract_v2 import MultiModalDataset
+
+# 导入真实数据集 (用于验证)
+from data.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
+from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
+from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
+from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+
+# LightGlue 可视化工具
+from lightglue import viz2d
+
+# --- 配置辅助函数 ---
+def get_default_config():
+    """
+    获取默认配置
+    模拟 PL_LightGlue 所需的配置结构，替代原本缺失的 yacs config
+    """
+    conf = SimpleNamespace()
+    conf.TRAINER = SimpleNamespace()
+    conf.TRAINER.CANONICAL_BS = 4
+    conf.TRAINER.CANONICAL_LR = 1e-4
+    conf.TRAINER.EXP_NAME = "lightglue_multimodal"
+    conf.TRAINER.TRUE_LR = 1e-4 # 实际学习率将在 main 函数中根据 BatchSize 自动调整
+    conf.TRAINER.PLOT_MODE = 'evaluation'
+    conf.MATCHING = {
+        'input_dim': 256,
+        'descriptor_dim': 256
+    }
+    return conf
+
+# --- 真实数据集包装器 ---
+class RealDatasetWrapper(torch.utils.data.Dataset):
+    """
+    包装真实数据集，使其输出格式与 MultiModalDataset (生成数据) 一致。
+    主要作用是：
+    1. 统一图像数值范围到 [0, 1]
+    2. 统一转为单通道灰度图
+    3. 统一返回字典格式
+    4. 统一变换矩阵方向
+    """
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        
+    def __len__(self):
+        return len(self.base_dataset)
+    
+    def __getitem__(self, idx):
+        # 真实数据集返回格式: (fix, moving_orig, moving_gt, fix_path, moving_path, T_0to1)
+        # 注意：真实数据集的 T_0to1 实际上是从 moving 到 fix 的变换 (fix = H * moving)
+        fix_tensor, moving_original_tensor, moving_gt_tensor, fix_path, moving_path, T_0to1 = self.base_dataset[idx]
+        
+        # 将 [-1, 1] 范围转换回 [0, 1]
+        moving_original_tensor = (moving_original_tensor + 1) / 2
+        moving_gt_tensor = (moving_gt_tensor + 1) / 2
+        
+        # 转灰度图
+        if fix_tensor.shape[0] == 3:
+            fix_gray = 0.299 * fix_tensor[0] + 0.587 * fix_tensor[1] + 0.114 * fix_tensor[2]
+            fix_gray = fix_gray.unsqueeze(0)
+        else:
+            fix_gray = fix_tensor
+            
+        if moving_gt_tensor.shape[0] == 3:
+            moving_gray = 0.299 * moving_gt_tensor[0] + 0.587 * moving_gt_tensor[1] + 0.114 * moving_gt_tensor[2]
+            moving_gray = moving_gray.unsqueeze(0)
+        else:
+            moving_gray = moving_gt_tensor
+            
+        if moving_original_tensor.shape[0] == 3:
+            moving_orig_gray = 0.299 * moving_original_tensor[0] + 0.587 * moving_original_tensor[1] + 0.114 * moving_original_tensor[2]
+            moving_orig_gray = moving_orig_gray.unsqueeze(0)
+        else:
+            moving_orig_gray = moving_original_tensor
+        
+        fix_name = os.path.basename(fix_path)
+        moving_name = os.path.basename(moving_path)
+        
+        # 统一变换矩阵方向：LightGlue 计算的是 Image0 -> Image1 的映射
+        # 这里 Image0 是 Fix, Image1 是 Moving
+        # 真实数据集的 T_0to1 是 Image1 -> Image0 (fix = T * moving)
+        # 所以我们需要取逆矩阵来得到 correct 的 T_0to1
+        try:
+            T_fix_to_moving = torch.inverse(T_0to1)
+        except:
+            T_fix_to_moving = T_0to1
+            
+        return {
+            'image0': fix_gray,
+            'image1': moving_orig_gray,
+            'image1_gt': moving_gray, # 用于计算 MSE
+            'T_0to1': T_fix_to_moving, # GT: Fix -> Moving
+            'pair_names': (fix_name, moving_name),
+            'dataset_name': 'MultiModal'
+        }
+
+# --- Data Module ---
+class MultimodalDataModule(pl.LightningDataModule):
+    """Lightning 数据模块，负责加载训练和验证数据"""
+    def __init__(self, args, config):
+        super().__init__()
+        self.args = args
+        self.config = config
+        self.loader_params = {
+            'batch_size': args.batch_size,
+            'num_workers': args.num_workers,
+            'pin_memory': True
+        }
+
+    def setup(self, stage=None):
+        if stage == 'fit' or stage is None:
+            # 训练集：使用基于 FIVES 的生成数据 (MultiModalDataset)
+            # 在 Dataset 内部已经应用了随机仿射变换
+            self.train_dataset = MultiModalDataset(
+                args.data_root, mode=self.args.mode, split='train', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
+            
+            # 验证集配置
+            if self.args.val_on_real:
+                # 加载真实数据集 (根据模式选择对应的 Dataset)
+                if self.args.mode == 'cfocta':
+                    base_dataset = CFOCTADataset(root_dir='data/CF_OCTA_v2_repaired', split='val', mode='cf2octa')
+                elif self.args.mode == 'cffa':
+                    base_dataset = CFFADataset(root_dir='data/operation_pre_filtered_cffa', split='val', mode='fa2cf')
+                elif self.args.mode == 'cfoct':
+                    base_dataset = CFOCTDataset(root_dir='data/operation_pre_filtered_cfoct', split='val', mode='cf2oct')
+                elif self.args.mode == 'octfa':
+                    base_dataset = OCTFADataset(root_dir='data/operation_pre_filtered_octfa', split='val', mode='fa2oct')
+                
+                # 包装真实数据集
+                self.val_dataset_real = RealDatasetWrapper(base_dataset)
+                # 同时保留生成数据验证集，仅供参考
+                self.val_dataset_gen = MultiModalDataset(
+                    args.data_root, mode=self.args.mode, split='val', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
+            else:
+                self.val_dataset = MultiModalDataset(
+                    args.data_root, mode=self.args.mode, split='val', img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
+
+    def train_dataloader(self):
+        return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
+
+    def val_dataloader(self):
+        # 如果在真实数据上验证，返回两个 DataLoader 列表
+        if self.args.val_on_real:
+            return [
+                torch.utils.data.DataLoader(self.val_dataset_gen, shuffle=False, **self.loader_params),
+                torch.utils.data.DataLoader(self.val_dataset_real, shuffle=False, **self.loader_params)
+            ]
+        else:
+            return torch.utils.data.DataLoader(self.val_dataset, shuffle=False, **self.loader_params)
+
+# --- 工具函数 ---
+def compute_corner_error(H_est, H_gt, height, width):
+    """计算角点平均误差 (MACE)"""
+    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+    corners_homo = np.concatenate([corners, np.ones((4, 1), dtype=np.float32)], axis=1)
+    
+    # GT 变换后的角点
+    corners_gt_homo = (H_gt @ corners_homo.T).T
+    corners_gt = corners_gt_homo[:, :2] / (corners_gt_homo[:, 2:] + 1e-6)
+    
+    # 预测变换后的角点
+    corners_est_homo = (H_est @ corners_homo.T).T
+    corners_est = corners_est_homo[:, :2] / (corners_est_homo[:, 2:] + 1e-6)
+    
+    try:
+        errors = np.sqrt(np.sum((corners_est - corners_gt)**2, axis=1))
+        mace = np.mean(errors)
+    except:
+        mace = float('inf')
+    return mace
+
+def create_chessboard(img1, img2, grid_size=4):
+    """创建棋盘格对比图"""
+    H, W = img1.shape
+    cell_h = H // grid_size
+    cell_w = W // grid_size
+    chessboard = np.zeros((H, W), dtype=img1.dtype)
+    for i in range(grid_size):
+        for j in range(grid_size):
+            y_start, y_end = i * cell_h, (i + 1) * cell_h
+            x_start, x_end = j * cell_w, (j + 1) * cell_w
+            if (i + j) % 2 == 0:
+                chessboard[y_start:y_end, x_start:x_end] = img1[y_start:y_end, x_start:x_end]
+            else:
+                chessboard[y_start:y_end, x_start:x_end] = img2[y_start:y_end, x_start:x_end]
+    return chessboard
+
+# --- 验证回调 ---
+class MultimodalValidationCallback(Callback):
+    """
+    Validation Callback
+    负责在每个 epoch 结束时：
+    1. 保存可视化结果 (配准图、棋盘图、匹配连线图)
+    2. 计算并记录评估指标 (MSE, MACE)
+    3. 保存最新和最优模型检查点
+    """
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.best_val = float('inf')
+        self.result_dir = Path(f"results/{args.mode}/{args.name}")
+        self.result_dir.mkdir(parents=True, exist_ok=True)
+        self.epoch_mses = []
+        self.epoch_maces = []
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self.epoch_mses = []
+        self.epoch_maces = []
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        # 确定保存子目录
+        if trainer.sanity_checking:
+            sub_dir = "step0"
+        else:
+            sub_dir = f"epoch{trainer.current_epoch + 1}"
+        
+        if self.args.val_on_real:
+            if dataloader_idx == 0:
+                epoch_dir = self.result_dir / f"{sub_dir}_generated" # 生成数据结果
+            else:
+                epoch_dir = self.result_dir / f"{sub_dir}_real" # 真实数据结果
+        else:
+            epoch_dir = self.result_dir / sub_dir
+            
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+        # 保存 Batch 结果并获取指标
+        batch_mses, batch_maces = self._save_batch_results(trainer, pl_module, batch, outputs, epoch_dir)
+        
+        # 仅收集真实数据集的指标用于模型评估
+        if self.args.val_on_real and dataloader_idx == 1:
+            self.epoch_mses.extend(batch_mses)
+            self.epoch_maces.extend(batch_maces)
+        elif not self.args.val_on_real:
+            self.epoch_mses.extend(batch_mses)
+            self.epoch_maces.extend(batch_maces)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        metrics = trainer.callback_metrics
+        logger.info(f"Epoch {epoch} finished. Metrics: {metrics}")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # 如果没有指标或只是 Sanity Check，不执行保存逻辑
+        if not self.epoch_mses or trainer.sanity_checking:
+            return
+            
+        epoch = trainer.current_epoch + 1
+        avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
+        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else float('inf')
+        
+        logger.info(f"Epoch {epoch} Validation: MSE (Real): {avg_mse:.6f}, MACE (Real): {avg_mace:.4f}")
+        
+        # 记录到 TensorBoard
+        pl_module.log("val_mse", avg_mse, on_epoch=True)
+        pl_module.log("val_mace", avg_mace, on_epoch=True)
+        
+        # 保存最新模型
+        latest_path = self.result_dir / "latest_checkpoint"
+        latest_path.mkdir(exist_ok=True)
+        trainer.save_checkpoint(latest_path / "model.ckpt")
+        
+        # 保存最优模型 (基于 MACE)
+        if avg_mace < self.best_val:
+            self.best_val = avg_mace
+            best_path = self.result_dir / "best_checkpoint"
+            best_path.mkdir(exist_ok=True)
+            trainer.save_checkpoint(best_path / "model.ckpt")
+            with open(best_path / "log.txt", "w") as f:
+                f.write(f"Epoch: {epoch}\nBest MACE: {avg_mace:.6f}\nBest MSE: {avg_mse:.6f}")
+
+    def _save_batch_results(self, trainer, pl_module, batch, outputs, epoch_dir):
+        """保存单个 Batch 的所有样本可视化结果"""
+        batch_size = batch['image0'].shape[0]
+        mses, maces = [], []
+        
+        H_ests = outputs['H_est'] # 估计的单应矩阵
+        Ts_gt = batch['T_0to1'].cpu().numpy() # 真值变换矩阵
+        
+        pair_names0 = batch['pair_names'][0]
+        pair_names1 = batch['pair_names'][1]
+
+        for i in range(batch_size):
+            sample_name = f"{Path(pair_names0[i]).stem}_vs_{Path(pair_names1[i]).stem}"
+            save_path = epoch_dir / sample_name
+            save_path.mkdir(parents=True, exist_ok=True)
+            
+            # 转为 numpy image
+            img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+            img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+            # 获取 GT 对齐后的图 (或 Origin)
+            ref_key = 'image1_gt' if 'image1_gt' in batch else 'image1_origin'
+            img1_gt = (batch[ref_key][i, 0].cpu().numpy() * 255).astype(np.uint8)
+
+            H_est = H_ests[i]
+            
+            # 应用单应变换 (Warp)
+            h, w = img0.shape
+            try:
+                H_inv = np.linalg.inv(H_est)
+                # 将 Moving 变换回 Fix 的视角
+                img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
+            except:
+                img1_result = img1.copy()
+            
+            # 计算 MSE
+            mse = np.mean(((img1_result / 255.0) - (img1_gt / 255.0)) ** 2)
+            mses.append(mse)
+            
+            # 计算 MACE
+            H_gt = Ts_gt[i]
+            mace = compute_corner_error(H_est, H_gt, h, w)
+            maces.append(mace)
+            
+            # 保存图像
+            cv2.imwrite(str(save_path / "fix.png"), img0)
+            cv2.imwrite(str(save_path / "moving.png"), img1)
+            cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
+            cv2.imwrite(str(save_path / "chessboard.png"), create_chessboard(img1_result, img0))
+            
+            # 绘制匹配连线图
+            try:
+                m0 = outputs['matches0'][i]
+                valid = m0 > -1
+                m_indices_0 = torch.where(valid)[0]
+                m_indices_1 = m0[valid]
+                kpts0 = outputs['kpts0'][i].cpu().numpy()
+                kpts1 = outputs['kpts1'][i].cpu().numpy()
+                
+                # 使用 Matplotlib 绘制
+                fig = plt.figure(figsize=(10, 4))
+                ax = fig.add_subplot(111)
+                viz2d.plot_images([img0, img1], titles=['Fix', 'Moving'])
+                viz2d.plot_matches(kpts0[m_indices_0], kpts1[m_indices_1], color='lime', lw=0.5)
+                plt.savefig(str(save_path / "matches.png"), bbox_inches='tight')
+                plt.close(fig)
+            except Exception as e:
+                logger.warning(f"Failed to plot matches: {e}")
+
+        return mses, maces
+
+# --- 自定义早停 ---
+class DelayedEarlyStopping(EarlyStopping):
+    """自定义早停，在指定的 start_epoch 之后才开始检测"""
+    def __init__(self, start_epoch=50, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_epoch = start_epoch
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.current_epoch >= self.start_epoch:
+            super().on_validation_end(trainer, pl_module)
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, default='cffa', choices=['cffa', 'cfoct', 'octfa', 'cfocta'], help='配准模式')
+    parser.add_argument('--name', '-n', type=str, default='lightglue_multimodal_new', help='实验名称')
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--img_size', type=int, default=512)
+    parser.add_argument('--vessel_sigma', type=float, default=6.0, help='虽然此处不用mask loss，但Dataset依然需要此参数')
+    parser.add_argument('--use_domain_randomization', action='store_true', default=True, help='是否启用域随机化增强')
+    parser.add_argument('--val_on_real', action='store_true', default=True, help='是否在真实数据集上验证')
+    parser.add_argument('--data_root', type=str, default="data/FIVES_extract_v2")
+    
+    parser = pl.Trainer.add_argparse_args(parser)
+    parser.set_defaults(max_epochs=500, gpus='1')
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    config = get_default_config()
+    
+    pl.seed_everything(66)
+    
+    # 初始化模型
+    model = PL_LightGlue(config)
+    # 初始化数据
+    data_module = MultimodalDataModule(args, config)
+    
+    # 验证回调
+    val_callback = MultimodalValidationCallback(args)
+    # 学习率监控
+    lr_monitor = LearningRateMonitor(logging_interval='step')
+    # 早停策略 (前100 epoch 不停，之后如果 MACE 在 10 epoch 内不下降则停)
+    early_stop_callback = DelayedEarlyStopping(
+        start_epoch=100, monitor='val_mace', patience=10, mode='min', min_delta=0.01
+    )
+    
+    # Trainer
+    trainer = pl.Trainer.from_argparse_args(
+        args,
+        min_epochs=20,
+        check_val_every_n_epoch=5, # 每5 epoch验证一次
+        num_sanity_val_steps=2,    # 训练前跑2个 batch 检查流程
+        callbacks=[val_callback, lr_monitor, early_stop_callback],
+        logger=TensorBoardLogger('logs/tb_logs', name=args.name),
+        replace_sampler_ddp=False,
+    )
+    
+    logger.info(f"Starting training: {args.name}")
+    trainer.fit(model, datamodule=data_module)
+
+if __name__ == '__main__':
+    main()

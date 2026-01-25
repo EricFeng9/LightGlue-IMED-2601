@@ -476,6 +476,7 @@ class LightGlue(nn.Module):
             stop: int
             prune0: [B x M]
             prune1: [B x N]
+            log_assignment: [B x M+1 x N+1] (optional)
         """
         with torch.autocast(enabled=self.conf.mp, device_type="cuda"):
             return self._forward(data)
@@ -626,6 +627,7 @@ class LightGlue(nn.Module):
             "scores": mscores,
             "prune0": prune0,
             "prune1": prune1,
+            "log_assignment": scores,
         }
 
     def confidence_threshold(self, layer_index: int) -> float:
