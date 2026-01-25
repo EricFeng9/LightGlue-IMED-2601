@@ -416,13 +416,20 @@ class DelayedEarlyStopping(EarlyStopping):
 
     def on_validation_end(self, trainer, pl_module):
         if trainer.current_epoch < self.start_epoch:
+            print(f"DEBUG: Skipping EarlyStopping check at epoch {trainer.current_epoch} (Warmup < {self.start_epoch})")
             return
         super().on_validation_end(trainer, pl_module)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.current_epoch < self.start_epoch:
+            print(f"DEBUG: Skipping EarlyStopping check at epoch {trainer.current_epoch} (Warmup < {self.start_epoch})")
             return
         super().on_validation_epoch_end(trainer, pl_module)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.current_epoch < self.start_epoch:
+            return
+        super().on_train_epoch_end(trainer, pl_module)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -458,7 +465,7 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval='step')
     # 早停策略 (前50 epoch 不停，之后如果 MACE 在 10 epoch 内不下降则停)
     early_stop_callback = DelayedEarlyStopping(
-        start_epoch=50, monitor='val_mace', patience=10, mode='min', min_delta=0.01
+        start_epoch=50, monitor='val_mace', patience=10, mode='min', min_delta=0.01, check_finite=False
     )
     
     # 解析 GPU 配置
