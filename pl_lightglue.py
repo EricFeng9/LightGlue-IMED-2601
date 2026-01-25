@@ -232,18 +232,29 @@ class PL_LightGlue(pl.LightningModule):
         loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
         
         # 确定验证集状态
-        num_dataloaders = getattr(self.trainer, 'num_val_dataloaders', 1)
+        # 为了避免 "called twice with different arguments" 错误，我们统一参数配置
+        # 并显式根据 dataloader_idx 区分 metric name
         
-        if num_dataloaders > 1:
-            if dataloader_idx == 0:
-                # 生成数据：仅记录用于观察，不参与核心指标 val_loss
-                self.log('val_loss_gen', loss, on_step=False, on_epoch=True, prog_bar=False, add_dataloader_idx=False)
-            else:
-                # 真实数据：这才是唯一的真神指标，供 Scheduler 监控
-                self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
-        else:
-            # 只有一个验证集时（比如关闭了真实数据验证），必须叫 val_loss 否则程序会崩
-            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
+        # 默认假设：idx=0 是生成数据(val_loss_gen), idx=1 是真实数据(val_loss)
+        # 除非只有一个 dataloader，此时必然是 idx=0 且作为主要验证集(val_loss)
+        
+        # 获取当前可用的验证集数量 (尝试从 trainer 获取，失败则根据 dataloader_idx 推断)
+        try:
+            val_dataloaders = self.trainer.val_dataloaders
+            num_dataloaders = len(val_dataloaders) if isinstance(val_dataloaders, list) else 1
+        except:
+            num_dataloaders = 1
+            
+        # 特殊情况处理：如果 args.val_on_real 为 False (只用生成数据)，那么 idx=0 应该是 val_loss
+        # 我们可以检查 config 中的标志，或者简单点：如果 num_dataloaders == 1，那只要是 idx=0 就是 val_loss
+        
+        metric_name = 'val_loss'
+        if num_dataloaders > 1 and dataloader_idx == 0:
+            metric_name = 'val_loss_gen'
+            
+        # 统一日志记录参数
+        # 注意：prog_bar=True对于两个指标都开启，这样可以在进度条看到两者
+        self.log(metric_name, loss, on_step=False, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
         
         # 获取预测的匹配对
         matches0 = outputs['matches0'] # [B, M], image0 中每个点在 image1 中的匹配索引
