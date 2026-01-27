@@ -130,7 +130,7 @@ class PL_LightGlue(pl.LightningModule):
         # 注意：我们修改了 LightGlue 源码，使其在输出中包含 'log_assignment' (对数赋值矩阵)
         return self.matcher(data)
 
-    def _compute_gt_matches(self, kpts0, kpts1, T_0to1, dist_th=3.0):
+    def _compute_gt_matches(self, kpts0, kpts1, T_0to1):
         """
         计算几何上的“Ground Truth”匹配对。
         原理：利用已知的变换矩阵 T_0to1，将图0的关键点变换到图1坐标系下，
@@ -140,10 +140,12 @@ class PL_LightGlue(pl.LightningModule):
             kpts0: [B, M, 2] 图0关键点
             kpts1: [B, N, 2] 图1关键点
             T_0to1: [B, 3, 3] 从图0到图1的变换矩阵 (Truth)
-            dist_th: 像素距离阈值 (默认 3.0 px)
         Returns:
             matches_gt: [B, M] 对应 kpts0 的真值匹配索引。如果无匹配则为 -1。
         """
+        # 从配置中获取阈值，默认为 3.0 (适合同模态/合成数据)，跨模态建议调大 (e.g. 5-10)
+        dist_th = self.config.MATCHING.get('dist_th', 3.0) if hasattr(self.config, 'MATCHING') else 3.0
+
         B, M, _ = kpts0.shape
         B, N, _ = kpts1.shape
         device = kpts0.device
@@ -168,6 +170,11 @@ class PL_LightGlue(pl.LightningModule):
         
         # 生成 GT 匹配索引 (-1 代表无匹配/垃圾桶)
         matches_gt = torch.where(mask, matched_indices, torch.tensor(-1, device=device))
+        
+        # Debug Log: 监控有多少对匹配被找到了
+        # valid_match_ratio = mask.float().mean()
+        # if valid_match_ratio < 0.01:
+        #     logger.warning(f"Low GT match ratio: {valid_match_ratio:.4f}. dist_th={dist_th}")
         
         return matches_gt
 
@@ -274,6 +281,13 @@ class PL_LightGlue(pl.LightningModule):
         mask0 = batch.get('vessel_mask0', None)
         loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'], mask0=mask0)
         
+        # Debug info: 计算并记录 Valid GT Matches 比例
+        # 重新取回 matches_gt 统计一下 (这会有一点点重复计算开销，但为了Debug值得)
+        with torch.no_grad():
+             matches_gt = self._compute_gt_matches(batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+             valid_ratio = (matches_gt > -1).float().mean()
+             self.log("train/valid_gt_ratio", valid_ratio, on_step=True, on_epoch=True, prog_bar=True)
+
         # 记录日志
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss

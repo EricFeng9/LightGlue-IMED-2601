@@ -47,7 +47,8 @@ def get_default_config():
     conf.TRAINER.PLOT_MODE = 'evaluation'
     conf.MATCHING = {
         'input_dim': 256,
-        'descriptor_dim': 256
+        'descriptor_dim': 256,
+        'dist_th': 10.0 # 真实数据训练关键修正：放宽GT匹配阈值 (3.0 -> 10.0)，防止因GT对齐不准导致无监督信号
     }
     return conf
 
