@@ -206,15 +206,24 @@ class CFFADataset(Dataset):
         moving_original_pil = Image.fromarray(moving_np).resize((SIZE, SIZE), Image.BICUBIC)
         
         # 7. Resize 到 512x512 并补偿 T_0to1 尺度
-        h_orig, w_orig = fix_filtered.shape[:2]
-        sx = SIZE / float(w_orig)
-        sy = SIZE / float(h_orig)
-        T_scale = np.array([
-            [sx, 0, 0],
-            [0, sy, 0],
+        h_orig, w_orig = fix_np.shape[:2]
+        h_mov_orig, w_mov_orig = moving_np.shape[:2]
+        
+        # 尺度补偿：T_scaled = T_fix_scale @ T_orig @ inv(T_mov_scale)
+        # 这样矩阵才能在 512x512 空间内自恰
+        T_fix_scale = np.array([
+            [SIZE / float(w_orig), 0, 0],
+            [0, SIZE / float(h_orig), 0],
             [0, 0, 1]
         ], dtype=np.float32)
-        T_0to1 = T_scale @ T_0to1
+        
+        T_mov_scale_inv = np.array([
+            [float(w_mov_orig) / SIZE, 0, 0],
+            [0, float(h_mov_orig) / SIZE, 0],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        T_0to1 = T_fix_scale @ T_0to1 @ T_mov_scale_inv
 
         fix_pil = Image.fromarray(fix_filtered).resize((SIZE, SIZE), Image.BICUBIC)
         moving_gt_pil = Image.fromarray(moving_gt_filtered).resize((SIZE, SIZE), Image.BICUBIC)
