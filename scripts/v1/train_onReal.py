@@ -27,7 +27,8 @@ from lightglue import LightGlue, SuperPoint
 from lightglue import viz2d
 
 # 导入数据集
-from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
+from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset as TrainCFFADataset
+from data.CFFA.cffa_dataset import CFFADataset as ValCFFADataset
 
 # 导入指标计算
 from scripts.v1.metrics import (
