@@ -330,6 +330,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "monitor": "combined_auc",  # 监控平均 AUC
+                "strict": False,
             },
         }
 

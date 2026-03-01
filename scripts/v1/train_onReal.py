@@ -245,6 +245,7 @@ class PL_LightGlue_Real(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "monitor": "combined_auc",
+                "strict": False,
             },
         }
 
