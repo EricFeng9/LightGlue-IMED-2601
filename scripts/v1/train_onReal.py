@@ -229,6 +229,9 @@ class PL_LightGlue_Real(pl.LightningModule):
         self.matcher = LightGlue(**lg_conf)
         
         self.force_viz = False
+        
+        # 用于跨 batch 累积 AUC，在 on_validation_epoch_end 中聚合
+        self._val_step_aucs = []  # list of (auc5, auc10, auc20)
 
     def configure_optimizers(self):
         lr = self.config.TRAINER.TRUE_LR
@@ -368,8 +371,12 @@ class PL_LightGlue_Real(pl.LightningModule):
         from scripts.v1.metrics import error_auc
         if len(metrics_batch.get('t_errs', [])) > 0:
             auc_dict = error_auc(metrics_batch['t_errs'], [5, 10, 20])
-            for k, v in auc_dict.items():
-                self.log(k, v, on_epoch=True, prog_bar=False, logger=True)
+            # 存入列表，由 on_validation_epoch_end 聚合后统一 log
+            self._val_step_aucs.append((
+                auc_dict.get('auc@5', 0.0),
+                auc_dict.get('auc@10', 0.0),
+                auc_dict.get('auc@20', 0.0)
+            ))
         
         return {
             'H_est': H_ests,
@@ -378,6 +385,25 @@ class PL_LightGlue_Real(pl.LightningModule):
             'matches0': matches0,
             'metrics_batch': metrics_batch
         }
+
+    def on_validation_epoch_start(self):
+        """每个验证 epoch 开始时重置 AUC 累积列表"""
+        self._val_step_aucs = []
+
+    def on_validation_epoch_end(self):
+        """在模型自身 hook 中 log combined_auc，确保 EarlyStopping 能找到该指标"""
+        if self._val_step_aucs:
+            auc5_mean  = sum(x[0] for x in self._val_step_aucs) / len(self._val_step_aucs)
+            auc10_mean = sum(x[1] for x in self._val_step_aucs) / len(self._val_step_aucs)
+            auc20_mean = sum(x[2] for x in self._val_step_aucs) / len(self._val_step_aucs)
+        else:
+            auc5_mean = auc10_mean = auc20_mean = 0.0
+        combined_auc = (auc5_mean + auc10_mean + auc20_mean) / 3.0
+        # 在模型 hook 里 log，EarlyStopping（运行于之后的 on_validation_end）一定能读到
+        self.log('auc@5',        auc5_mean,    on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@10',       auc10_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@20',       auc20_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('combined_auc', combined_auc, on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
 
 # ==========================================
 # 回调类: MultimodalValidationCallback
@@ -458,7 +484,8 @@ class MultimodalValidationCallback(Callback):
         
         display_metrics = {'mse': avg_mse, 'mace': avg_mace}
         
-        for k in ['auc@5', 'auc@10', 'auc@20']:
+        # combined_auc 已由模型的 on_validation_epoch_end 先行 log，这里直接读取
+        for k in ['auc@5', 'auc@10', 'auc@20', 'combined_auc']:
             if k in metrics:
                 display_metrics[k] = metrics[k].item()
             else:
@@ -467,20 +494,18 @@ class MultimodalValidationCallback(Callback):
         if 'val_loss' in metrics:
             display_metrics['val_loss'] = metrics['val_loss'].item()
         
-        metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        
-        auc5 = display_metrics.get('auc@5', 0.0)
-        auc10 = display_metrics.get('auc@10', 0.0)
-        auc20 = display_metrics.get('auc@20', 0.0)
-        combined_auc = (auc5 + auc10 + auc20) / 3.0
-        
+        auc5        = display_metrics.get('auc@5', 0.0)
+        auc10       = display_metrics.get('auc@10', 0.0)
+        auc20       = display_metrics.get('auc@20', 0.0)
+        combined_auc = display_metrics.get('combined_auc', 0.0)
         inverse_mace = 1.0 / (1.0 + avg_mace)
         
-        pl_module.log("val_mse", avg_mse, on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("val_mace", avg_mace, on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("combined_auc", combined_auc, on_epoch=True, prog_bar=True, logger=True)
+        # 仅在回调中 log 不涉及早停监控的辅助指标
+        pl_module.log("val_mse",      avg_mse,      on_epoch=True, prog_bar=False, logger=True)
+        pl_module.log("val_mace",     avg_mace,     on_epoch=True, prog_bar=False, logger=True)
         pl_module.log("inverse_mace", inverse_mace, on_epoch=True, prog_bar=False, logger=True)
         
+        metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
         logger.info(f"Epoch {epoch} 验证总结 >> {metric_str} | combined_auc: {combined_auc:.4f}")
         
         self.current_val_metrics[epoch] = {
@@ -694,7 +719,8 @@ def main():
         monitor='combined_auc',
         mode='max',
         patience=10,
-        min_delta=0.0001
+        min_delta=0.0001,
+        strict=False  # 首个 epoch 若指标未出现不报错（兼容性保障）
     )
     
     logger.info("早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
