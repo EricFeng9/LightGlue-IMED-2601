@@ -198,12 +198,12 @@ class MultimodalDataModule(pl.LightningDataModule):
             
             # 训练集：使用 operation_pre_filtered_cffa 真实数据
             train_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            train_base = CFFADataset(root_dir=str(train_data_dir), split='train', mode='fa2cf')
+            train_base = TrainCFFADataset(root_dir=str(train_data_dir), split='train', mode='fa2cf')
             self.train_dataset = RealDatasetWrapper(train_base)
             
             # 验证集：使用 CFFA 真实数据（与 train_onEnhancedGen_v2.py 对齐）
             val_data_dir = script_dir / 'data' / 'CFFA'
-            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='fa2cf')
+            val_base = ValCFFADataset(root_dir=str(val_data_dir), split='val', mode='fa2cf')
             self.val_dataset = RealDatasetWrapper(val_base)
 
     def train_dataloader(self):
