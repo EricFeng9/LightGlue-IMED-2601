@@ -14,7 +14,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from pytorch_lightning.strategies import DDPStrategy
 import logging
 from types import SimpleNamespace
@@ -261,27 +261,17 @@ class MultimodalDataModule(pl.LightningDataModule):
         }
 
     def setup(self, stage=None):
-        if stage == 'fit' or stage is None:
-            # 训练集使用生成数据 (260227_2_v29_2_1)
-            # 验证集使用真实数据 (operation_pre_filtered_cffa)
-            # 使用绝对路径确保在任何目录下运行都能找到数据
-            script_dir = Path(__file__).parent.parent.parent
-            
-            # 训练集：生成数据
-            train_data_dir = script_dir / 'data' / '260227_2_v29_2_1'
-            train_base = MultiModalDataset(root_dir=str(train_data_dir), split='train', mode='cffa', img_size=self.args.img_size)
-            self.train_dataset = GenDatasetWrapper(train_base)
-            
-            # 验证集：真实数据
-            val_data_dir = script_dir / 'data' / 'CFFA'
-            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='fa2cf')
-            self.val_dataset = RealDatasetWrapper(val_base)
+        # 测试阶段使用真实数据集（CFFA）
+        # 使用绝对路径确保在任何目录下运行都能找到数据
+        script_dir = Path(__file__).parent.parent.parent
+        
+        # 测试集：真实数据
+        test_data_dir = script_dir / 'data' / 'CFFA'
+        test_base = CFFADataset(root_dir=str(test_data_dir), split=self.args.split, mode='fa2cf')
+        self.test_dataset = RealDatasetWrapper(test_base)
 
-    def train_dataloader(self):
-        return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
-
-    def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, shuffle=False, **self.loader_params)
+    def test_dataloader(self):
+        return torch.utils.data.DataLoader(self.test_dataset, shuffle=False, **self.loader_params)
 
 # ==========================================
 # 核心模型: PL_LightGlue_Gen
@@ -393,21 +383,13 @@ class PL_LightGlue_Gen(pl.LightningModule):
         
         return loss
 
-    def training_step(self, batch, batch_idx):
-        """训练步骤（生成数据训练）"""
-        outputs = self(batch)
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
-        
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        """验证步骤（兼容 metrics.py）"""
+    def test_step(self, batch, batch_idx):
+        """测试步骤（兼容 metrics.py）"""
         outputs = self(batch)
         
-        # 计算验证损失
+        # 计算测试损失
         loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         
         # 获取预测的匹配对
         matches0 = outputs['matches0']
@@ -460,7 +442,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
         }
         
         # 使用 metrics.py 计算指标
-        set_metrics_verbose(True)  # 验证时输出详细日志
+        set_metrics_verbose(True)  # 测试时输出详细日志
         compute_homography_errors(metrics_batch, self.config)
         
         # 提取 AUC 指标
@@ -479,80 +461,41 @@ class PL_LightGlue_Gen(pl.LightningModule):
         }
 
 # ==========================================
-# 回调逻辑: MultimodalValidationCallback
+# 回调逻辑: TestCallback
 # ==========================================
-class MultimodalValidationCallback(Callback):
-    def __init__(self, args):
+class TestCallback(Callback):
+    def __init__(self, args, output_dir):
         super().__init__()
         self.args = args
-        self.best_val = -1.0
-        self.result_dir = Path(f"results/lightglue_{args.mode}/{args.name}")
-        self.result_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_mses = []
         self.epoch_maces = []
 
         import csv
-        self.csv_path = self.result_dir / "metrics.csv"
-        if not self.csv_path.exists():
-            with open(self.csv_path, "w", newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Epoch", "Train Loss", "Val Loss", "Val MSE", "Val MACE", "Val AUC@5", "Val AUC@10", "Val AUC@20", "Val Combined AUC", "Val Inverse MACE"])
-        
-        self.current_train_metrics = {}
-        self.current_val_metrics = {}
+        self.csv_path = self.output_dir / "test_metrics.csv"
+        with open(self.csv_path, "w", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Batch", "Test Loss", "MSE", "MACE", "AUC@5", "AUC@10", "AUC@20"])
 
-    def _try_write_csv(self, epoch):
-        if epoch in self.current_train_metrics and epoch in self.current_val_metrics:
-            t = self.current_train_metrics.pop(epoch)
-            v = self.current_val_metrics.pop(epoch)
-            import csv
-            with open(self.csv_path, "a", newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    epoch,
-                    t.get('loss', ''),
-                    v.get('val_loss', ''),
-                    v['mse'],
-                    v['mace'],
-                    v['auc5'],
-                    v['auc10'],
-                    v['auc20'],
-                    v['combined_auc'],
-                    v['inverse_mace']
-                ])
-
-    def on_validation_epoch_start(self, trainer, pl_module):
+    def on_test_epoch_start(self, trainer, pl_module):
         self.epoch_mses = []
         self.epoch_maces = []
+        self.batch_metrics = []
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, None, save_images=False)
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, batch_idx, save_images=True)
         self.epoch_mses.extend(batch_mses)
         self.epoch_maces.extend(batch_maces)
 
-    def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch + 1
-        metrics = trainer.callback_metrics
-        display_metrics = {}
-        
-        if 'train/loss_epoch' in metrics:
-            display_metrics['loss'] = metrics['train/loss_epoch'].item()
-        
-        if display_metrics:
-            metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-            logger.info(f"Epoch {epoch} 训练总结 >> {metric_str}")
-        
-        self.current_train_metrics[epoch] = display_metrics
-        self._try_write_csv(epoch)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
+    def on_test_epoch_end(self, trainer, pl_module):
         if not self.epoch_mses:
+            logger.warning("没有收集到任何测试指标")
             return
         
         avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
         avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else float('inf')
         
-        epoch = trainer.current_epoch + 1
         metrics = trainer.callback_metrics
         
         display_metrics = {'mse': avg_mse, 'mace': avg_mace}
@@ -564,9 +507,9 @@ class MultimodalValidationCallback(Callback):
             else:
                 display_metrics[k] = 0.0
         
-        # 从 metrics 中获取 val_loss
-        if 'val_loss' in metrics:
-            display_metrics['val_loss'] = metrics['val_loss'].item()
+        # 从 metrics 中获取 test_loss
+        if 'test_loss' in metrics:
+            display_metrics['test_loss'] = metrics['test_loss'].item()
         
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
         
@@ -578,68 +521,25 @@ class MultimodalValidationCallback(Callback):
         
         inverse_mace = 1.0 / (1.0 + avg_mace)
         
-        pl_module.log("val_mse", avg_mse, on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("val_mace", avg_mace, on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("combined_auc", combined_auc, on_epoch=True, prog_bar=True, logger=True)
-        pl_module.log("inverse_mace", inverse_mace, on_epoch=True, prog_bar=False, logger=True)
+        logger.info(f"测试总结 >> {metric_str} | combined_auc: {combined_auc:.4f} | inverse_mace: {inverse_mace:.6f}")
         
-        logger.info(f"Epoch {epoch} 验证总结 >> {metric_str} | combined_auc: {combined_auc:.4f} | inverse_mace: {inverse_mace:.6f}")
+        # 保存总结报告
+        summary_path = self.output_dir / "test_summary.txt"
+        with open(summary_path, "w") as f:
+            f.write(f"测试总结\n")
+            f.write(f"=" * 50 + "\n")
+            f.write(f"测试损失: {display_metrics.get('test_loss', 0.0):.6f}\n")
+            f.write(f"MSE: {avg_mse:.6f}\n")
+            f.write(f"MACE: {avg_mace:.4f}\n")
+            f.write(f"AUC@5: {auc5:.4f}\n")
+            f.write(f"AUC@10: {auc10:.4f}\n")
+            f.write(f"AUC@20: {auc20:.4f}\n")
+            f.write(f"Combined AUC: {combined_auc:.4f}\n")
+            f.write(f"Inverse MACE: {inverse_mace:.6f}\n")
         
-        self.current_val_metrics[epoch] = {
-            'mse': avg_mse,
-            'mace': avg_mace,
-            'auc5': auc5,
-            'auc10': auc10,
-            'auc20': auc20,
-            'combined_auc': combined_auc,
-            'inverse_mace': inverse_mace,
-            'val_loss': display_metrics.get('val_loss', 0.0)
-        }
-        self._try_write_csv(epoch)
-        
-        # 保存最新模型
-        latest_path = self.result_dir / "latest_checkpoint"
-        latest_path.mkdir(exist_ok=True)
-        trainer.save_checkpoint(latest_path / "model.ckpt")
-            
-        # 评价最优模型（基于平均AUC）
-        is_best = False
-        if combined_auc > self.best_val:
-            self.best_val = combined_auc
-            is_best = True
-            best_path = self.result_dir / "best_checkpoint"
-            best_path.mkdir(exist_ok=True)
-            trainer.save_checkpoint(best_path / "model.ckpt")
-            with open(best_path / "log.txt", "w") as f:
-                f.write(f"Epoch: {epoch}\n")
-                f.write(f"Best Combined AUC: {combined_auc:.4f}\n")
-                f.write(f"AUC@5: {auc5:.4f}\n")
-                f.write(f"AUC@10: {auc10:.4f}\n")
-                f.write(f"AUC@20: {auc20:.4f}\n")
-                f.write(f"MACE: {avg_mace:.4f}\n")
-                f.write(f"MSE: {avg_mse:.6f}\n")
-            logger.info(f"发现新的最优模型! Epoch {epoch}, Combined AUC: {combined_auc:.4f}")
+        logger.info(f"测试总结已保存到: {summary_path}")
 
-        if is_best or (epoch % 5 == 0):
-            self._trigger_visualization(trainer, pl_module, is_best, epoch)
-
-    def _trigger_visualization(self, trainer, pl_module, is_best, epoch):
-        pl_module.force_viz = True
-        target_dir = self.result_dir / (f"epoch{epoch}_best" if is_best else f"epoch{epoch}")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        
-        val_dataloader = trainer.val_dataloaders[0] if isinstance(trainer.val_dataloaders, list) else trainer.val_dataloaders
-        pl_module.eval()
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(val_dataloader):
-                if batch_idx > 5:
-                    break
-                batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                outputs = pl_module.validation_step(batch, batch_idx)
-                self._process_batch(trainer, pl_module, batch, outputs, target_dir, save_images=True)
-        pl_module.force_viz = False
-
-    def _process_batch(self, trainer, pl_module, batch, outputs, epoch_dir, save_images=False):
+    def _process_batch(self, trainer, pl_module, batch, outputs, batch_idx, save_images=False):
         batch_size = batch['image0'].shape[0]
         mses, maces = [], []
         H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
@@ -676,11 +576,13 @@ class MultimodalValidationCallback(Callback):
             maces.append(compute_corner_error(H_est, Ts_gt[i], h, w))
             
             if save_images:
-                sample_name = f"{Path(batch['pair_names'][0][i]).stem}_vs_{Path(batch['pair_names'][1][i]).stem}"
-                save_path = epoch_dir / sample_name
+                sample_name = f"batch{batch_idx:04d}_sample{i:02d}_{Path(batch['pair_names'][0][i]).stem}_vs_{Path(batch['pair_names'][1][i]).stem}"
+                save_path = self.output_dir / sample_name
                 save_path.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(save_path / "fix.png"), img0)
+                cv2.imwrite(str(save_path / "moving_original.png"), img1)
                 cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
+                cv2.imwrite(str(save_path / "moving_gt.png"), img1_gt)
                 
                 # 绘制关键点和匹配
                 img0_color = cv2.cvtColor(img0, cv2.COLOR_GRAY2BGR)
@@ -729,36 +631,31 @@ class MultimodalValidationCallback(Callback):
                     cv2.imwrite(str(save_path / "chessboard.png"), cb)
                 except:
                     pass
+                
+                # 保存单样本指标
+                with open(save_path / "metrics.txt", "w") as f:
+                    f.write(f"MSE: {mse:.6f}\n")
+                    f.write(f"MACE: {maces[-1]:.4f}\n")
+                    f.write(f"Matches: {len(m_indices_0) if 'matches0' in outputs else 0}\n")
         
-        if rejected_count > 0 and save_images:
+        if rejected_count > 0:
             logger.info(f"防爆锁触发: {rejected_count}/{batch_size} 个样本的单应矩阵被重置为单位矩阵")
         
         return mses, maces
 
 # ==========================================
-# 早停机制
-# ==========================================
-class DelayedEarlyStopping(EarlyStopping):
-    def __init__(self, start_epoch=50, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.start_epoch = start_epoch
-    
-    def on_validation_end(self, trainer, pl_module):
-        if trainer.current_epoch >= self.start_epoch:
-            super().on_validation_end(trainer, pl_module)
-
-# ==========================================
 # 参数解析和主函数
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="LightGlue Gen-Data Training with 260227_2_v29_2_1 Dataset")
-    parser.add_argument('--name', '-n', type=str, default='lightglue_gen_baseline', help='训练名称')
+    parser = argparse.ArgumentParser(description="LightGlue Gen-Data Testing with 260227_2_v29_2_1 Dataset")
+    parser.add_argument('--name', '-n', type=str, required=True, help='训练模型名称（用于定位checkpoint）')
+    parser.add_argument('--test_name', type=str, default='test_results', help='测试名称（用于指定输出子目录）')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--img_size', type=int, default=512)
-    parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复训练')
-    parser.add_argument('--max_epochs', type=int, default=200)
-    parser.add_argument('--gpus', type=str, default='1')
+    parser.add_argument('--checkpoint', type=str, default=None, help='检查点路径（默认使用best_checkpoint）')
+    parser.add_argument('--gpus', type=str, default='0')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'], help='测试数据集划分')
     return parser.parse_args()
 
 def main():
@@ -769,16 +666,30 @@ def main():
     config.TRAINER.SEED = 66
     pl.seed_everything(config.TRAINER.SEED)
     
-    # 修复路径
-    result_dir = Path(f"results/lightglue_{args.mode}/{args.name}")
-    result_dir.mkdir(parents=True, exist_ok=True)
-    log_file = result_dir / "log.txt"
+    # 确定checkpoint路径
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+    else:
+        # 默认使用best_checkpoint
+        ckpt_path = Path(f"results/lightglue_{args.mode}/{args.name}/best_checkpoint/model.ckpt")
+    
+    if not ckpt_path.exists():
+        logger.error(f"检查点不存在: {ckpt_path}")
+        logger.info(f"请确保训练模型存在，或使用 --checkpoint 指定有效的检查点路径")
+        return
+    
+    logger.info(f"加载检查点: {ckpt_path}")
+    
+    # 设置输出目录
+    output_dir = Path(f"results/lightglue_{args.mode}/{args.name}/{args.test_name}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / "test_log.txt"
     
     # 配置日志
     logger.remove()
     log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
     logger.add(sys.stderr, format=log_format, level="INFO")
-    logger.add(log_file, format=log_format, level="INFO", mode="a", backtrace=True, diagnose=False)
+    logger.add(log_file, format=log_format, level="INFO", mode="w", backtrace=True, diagnose=False)
     logger.info(f"日志将同时保存到: {log_file}")
     
     # 设置环境变量，让 metrics.py 也写入日志文件
@@ -801,45 +712,30 @@ def main():
     _scaling = config.TRAINER.TRUE_BATCH_SIZE / config.TRAINER.CANONICAL_BS
     config.TRAINER.TRUE_LR = config.TRAINER.CANONICAL_LR * _scaling
     
-    # 初始化模型
-    model = PL_LightGlue_Gen(config, result_dir=str(result_dir))
+    logger.info(f"GPU 配置: devices={gpus_list}, num_gpus={_n_gpus}")
+    logger.info(f"测试名称: {args.test_name}")
+    logger.info(f"测试数据集划分: {args.split}")
+    logger.info(f"输出目录: {output_dir}")
+    
+    # 从检查点加载模型
+    model = PL_LightGlue_Gen.load_from_checkpoint(
+        str(ckpt_path),
+        config=config,
+        result_dir=str(output_dir)
+    )
+    model.eval()
     
     # 初始化数据模块
     data_module = MultimodalDataModule(args, config)
     
     # TensorBoard 日志
-    tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=f"lightglue_{args.name}")
-    
-    # 早停配置
-    early_stop_callback = DelayedEarlyStopping(
-        start_epoch=0,
-        monitor='combined_auc',
-        mode='max',
-        patience=10,
-        min_delta=0.0001
-    )
-    
-    logger.info("早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
-    
-    # 确保 args 有 mode 属性（用于回调）
-    if not hasattr(args, 'mode'):
-        args.mode = 'gen'
-    
-    logger.info(f"GPU 配置: devices={gpus_list}, num_gpus={_n_gpus}")
-    logger.info(f"学习率: {config.TRAINER.TRUE_LR:.6f} (scaled from {config.TRAINER.CANONICAL_LR})")
+    tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=f"lightglue_test_{args.name}_{args.test_name}")
     
     # Trainer 配置
     trainer_kwargs = {
-        'max_epochs': args.max_epochs,
         'accelerator': "gpu" if torch.cuda.is_available() else "cpu",
         'devices': gpus_list,
-        'num_sanity_val_steps': 0,
-        'check_val_every_n_epoch': 1,
-        'callbacks': [
-            MultimodalValidationCallback(args), 
-            LearningRateMonitor(logging_interval='step'), 
-            early_stop_callback
-        ],
+        'callbacks': [TestCallback(args, output_dir)],
         'logger': tb_logger,
     }
     
@@ -849,12 +745,12 @@ def main():
     
     trainer = pl.Trainer(**trainer_kwargs)
     
-    # 如果指定了检查点，从检查点恢复
-    ckpt_path = args.start_point if args.start_point else None
+    logger.info(f"开始测试 (模型: {args.name} | 测试集: CFFA 真实数据 {args.split} split)")
+    trainer.test(model, datamodule=data_module)
     
-    logger.info(f"开始混合训练 (训练集: 260227_2_v29_2_1 生成数据 | 验证集: CFFA 真实数据): {args.name}")
-    trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
+    logger.info(f"测试完成! 结果已保存到: {output_dir}")
 
 if __name__ == '__main__':
     main()
+
 

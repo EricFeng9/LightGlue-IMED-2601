@@ -54,32 +54,46 @@ def apply_fov_destruction_tensor(img_tensor, center_jitter=0.08, radius_jitter=0
     return img_tensor
 
 def apply_black_stripes_tensor(img_tensor, num_stripes_range=(1, 3), stripe_width_range=(1, 3)):
-    """加入少量横竖黑色条纹损坏数据"""
+    """加入少量横竖黑色条纹损坏数据（batch内所有图像应用相同的条纹位置）"""
     B, C, H, W = img_tensor.shape
     mask = torch.ones_like(img_tensor)
+    
+    # 对整个batch使用相同的条纹参数
+    num_stripes = random.randint(*num_stripes_range)
+    stripe_params = []
+    for _ in range(num_stripes):
+        is_vertical = random.random() < 0.5
+        width = random.randint(*stripe_width_range)
+        if is_vertical:
+            pos = random.randint(0, max(1, W - width - 1))
+        else:
+            pos = random.randint(0, max(1, H - width - 1))
+        stripe_params.append((is_vertical, width, pos))
+    
+    # 对batch内所有图像应用相同的条纹
     for b in range(B):
-        num_stripes = random.randint(*num_stripes_range)
-        for _ in range(num_stripes):
-            is_vertical = random.random() < 0.5
-            width = random.randint(*stripe_width_range)
+        for is_vertical, width, pos in stripe_params:
             if is_vertical:
-                pos = random.randint(0, max(1, W - width - 1))
                 mask[b, :, :, pos:pos+width] = 0.0
             else:
-                pos = random.randint(0, max(1, H - width - 1))
                 mask[b, :, pos:pos+width, :] = 0.0
+    
     return img_tensor * mask
 
 def apply_nonuniform_gaussian_noise_tensor(img_tensor, noise_std_max=0.08, dark_spot_strength=0.35):
-    """不均匀地加入高斯噪声（模拟光照不均匀在图像上产生的暗色位置）"""
+    """不均匀地加入高斯噪声（模拟光照不均匀在图像上产生的暗色位置）
+    batch内所有图像使用相同的噪声分布图"""
     B, C, H, W = img_tensor.shape
     device = img_tensor.device
     
-    # 随机生成一个低分辨率的 map
-    noise_variance_map = torch.rand(B, 1, 4, 4, device=device)
+    # 随机生成一个低分辨率的 map（对整个batch使用相同的map）
+    noise_variance_map = torch.rand(1, 1, 4, 4, device=device)  # 改为 [1, 1, 4, 4]
     # 让map更稀疏，只保留高值区域（局部暗斑）- 提高阈值让暗斑范围更小
     noise_variance_map = torch.where(noise_variance_map > 0.75, noise_variance_map, torch.zeros_like(noise_variance_map))
     noise_variance_map = F.interpolate(noise_variance_map, size=(H, W), mode='bicubic', align_corners=False)
+    
+    # 扩展到整个batch
+    noise_variance_map = noise_variance_map.expand(B, 1, H, W)
     
     # 基于 map 生成不均匀的噪声
     noise = torch.randn_like(img_tensor) * (noise_variance_map * noise_std_max)
@@ -162,15 +176,15 @@ def random_domain_augment_image(image):
     # 3. 非线性 Gamma 变换 (50% 概率，模拟不同模态的非线性灰度映射)
     if random.random() < 0.5:
         B = img_tensor.shape[0]
+        gamma = random.uniform(0.5, 2.0)  # 对整个batch使用相同的gamma值
         for b in range(B):
-            gamma = random.uniform(0.5, 2.0)
             img_tensor[b] = torch.pow(img_tensor[b].clamp(1e-6, 1.0), gamma)
         
     # 4. 对比度剧烈随机调整 (0.6x - 1.5x，温和范围，避免图像完全变黑或过曝)
     # 【关键修复】之前的 0.3-2.5 范围过于极端，会导致血管特征完全丢失
     B = img_tensor.shape[0]
+    contrast = random.uniform(0.6, 1.5)  # 对整个batch使用相同的对比度值
     for b in range(B):
-        contrast = random.uniform(0.6, 1.5)
         mean_val = img_tensor[b].mean()
         img_tensor[b] = (img_tensor[b] - mean_val) * contrast + mean_val
     img_tensor = img_tensor.clamp(0, 1)
@@ -202,7 +216,8 @@ def random_domain_augment_image(image):
         
     # 9. 添加少量全局高斯噪声
     if random.random() < 0.1:
-        noise = torch.randn_like(img_tensor) * random.uniform(0.002, 0.008)
+        noise_std = random.uniform(0.002, 0.008)  # 对整个batch使用相同的噪声强度
+        noise = torch.randn_like(img_tensor) * noise_std
         img_tensor = (img_tensor + noise).clamp(0, 1)
         
     # 规约到合法区间
