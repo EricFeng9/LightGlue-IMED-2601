@@ -299,6 +299,9 @@ class PL_LightGlue_Gen(pl.LightningModule):
         
         # 用于控制是否强制可视化
         self.force_viz = False
+        
+        # 用于跨 batch 累积 AUC，在 on_test_epoch_end 中聚合（与训练验证逻辑一致）
+        self._test_step_aucs = []  # list of (auc5, auc10, auc20)
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -449,12 +452,15 @@ class PL_LightGlue_Gen(pl.LightningModule):
         set_metrics_verbose(True)  # 测试时输出详细日志
         compute_homography_errors(metrics_batch, self.config)
         
-        # 提取 AUC 指标
+        # 提取 AUC 指标（与训练验证逻辑一致：累积到列表，由 on_test_epoch_end 聚合）
         from scripts.v1.metrics import error_auc
         if len(metrics_batch.get('t_errs', [])) > 0:
             auc_dict = error_auc(metrics_batch['t_errs'], [5, 10, 20])
-            for k, v in auc_dict.items():
-                self.log(k, v, on_epoch=True, prog_bar=False, logger=True)
+            self._test_step_aucs.append((
+                auc_dict.get('auc@5', 0.0),
+                auc_dict.get('auc@10', 0.0),
+                auc_dict.get('auc@20', 0.0)
+            ))
         
         return {
             'H_est': H_ests,
@@ -463,6 +469,24 @@ class PL_LightGlue_Gen(pl.LightningModule):
             'matches0': matches0,
             'metrics_batch': metrics_batch
         }
+
+    def on_test_epoch_start(self):
+        """每个测试 epoch 开始时重置 AUC 累积列表"""
+        self._test_step_aucs = []
+
+    def on_test_epoch_end(self):
+        """在模型自身 hook 中聚合并 log AUC（与训练验证逻辑完全一致）"""
+        if self._test_step_aucs:
+            auc5_mean  = sum(x[0] for x in self._test_step_aucs) / len(self._test_step_aucs)
+            auc10_mean = sum(x[1] for x in self._test_step_aucs) / len(self._test_step_aucs)
+            auc20_mean = sum(x[2] for x in self._test_step_aucs) / len(self._test_step_aucs)
+        else:
+            auc5_mean = auc10_mean = auc20_mean = 0.0
+        combined_auc = (auc5_mean + auc10_mean + auc20_mean) / 3.0
+        self.log('auc@5',        auc5_mean,    on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@10',       auc10_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@20',       auc20_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('combined_auc', combined_auc, on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
 
 # ==========================================
 # 回调逻辑: TestCallback
@@ -504,27 +528,23 @@ class TestCallback(Callback):
         
         display_metrics = {'mse': avg_mse, 'mace': avg_mace}
         
-        # 从 metrics 中获取 AUC 指标
-        for k in ['auc@5', 'auc@10', 'auc@20']:
+        # combined_auc 已由模型的 on_test_epoch_end 先行 log，这里直接读取（与训练回调对齐）
+        for k in ['auc@5', 'auc@10', 'auc@20', 'combined_auc']:
             if k in metrics:
                 display_metrics[k] = metrics[k].item()
             else:
                 display_metrics[k] = 0.0
         
-        # 从 metrics 中获取 test_loss
         if 'test_loss' in metrics:
             display_metrics['test_loss'] = metrics['test_loss'].item()
         
-        metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        
-        # 计算综合 AUC
-        auc5 = display_metrics.get('auc@5', 0.0)
-        auc10 = display_metrics.get('auc@10', 0.0)
-        auc20 = display_metrics.get('auc@20', 0.0)
-        combined_auc = (auc5 + auc10 + auc20) / 3.0
-        
+        auc5        = display_metrics.get('auc@5', 0.0)
+        auc10       = display_metrics.get('auc@10', 0.0)
+        auc20       = display_metrics.get('auc@20', 0.0)
+        combined_auc = display_metrics.get('combined_auc', 0.0)
         inverse_mace = 1.0 / (1.0 + avg_mace)
         
+        metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
         logger.info(f"测试总结 >> {metric_str} | combined_auc: {combined_auc:.4f} | inverse_mace: {inverse_mace:.6f}")
         
         # 保存总结报告
