@@ -522,20 +522,24 @@ class TestCallback(Callback):
         
         display_metrics = {'mse': avg_mse, 'mace': avg_mace}
         
-        # combined_auc 已由模型的 on_test_epoch_end 先行 log，这里直接读取（与训练回调对齐）
-        for k in ['auc@5', 'auc@10', 'auc@20', 'combined_auc']:
-            if k in metrics:
-                display_metrics[k] = metrics[k].item()
-            else:
-                display_metrics[k] = 0.0
+        # 直接从模型累积的 _test_step_aucs 计算 AUC（避免 callback_metrics 时序问题）
+        if hasattr(pl_module, '_test_step_aucs') and pl_module._test_step_aucs:
+            aucs = pl_module._test_step_aucs
+            auc5  = sum(x[0] for x in aucs) / len(aucs)
+            auc10 = sum(x[1] for x in aucs) / len(aucs)
+            auc20 = sum(x[2] for x in aucs) / len(aucs)
+        else:
+            auc5 = auc10 = auc20 = 0.0
+        combined_auc = (auc5 + auc10 + auc20) / 3.0
+        
+        display_metrics['auc@5'] = auc5
+        display_metrics['auc@10'] = auc10
+        display_metrics['auc@20'] = auc20
+        display_metrics['combined_auc'] = combined_auc
         
         if 'test_loss' in metrics:
             display_metrics['test_loss'] = metrics['test_loss'].item()
         
-        auc5        = display_metrics.get('auc@5', 0.0)
-        auc10       = display_metrics.get('auc@10', 0.0)
-        auc20       = display_metrics.get('auc@20', 0.0)
-        combined_auc = display_metrics.get('combined_auc', 0.0)
         inverse_mace = 1.0 / (1.0 + avg_mace)
         
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
