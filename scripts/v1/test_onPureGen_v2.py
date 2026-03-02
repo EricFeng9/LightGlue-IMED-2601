@@ -261,14 +261,18 @@ class MultimodalDataModule(pl.LightningDataModule):
         }
 
     def setup(self, stage=None):
-        # 测试阶段使用真实数据集（CFFA）
-        # 使用绝对路径确保在任何目录下运行都能找到数据
+        # 测试阶段使用 CFFA 全集（训练集 + 测试集）
         script_dir = Path(__file__).parent.parent.parent
         
-        # 测试集：真实数据
         test_data_dir = script_dir / 'data' / 'CFFA'
-        test_base = CFFADataset(root_dir=str(test_data_dir), split=self.args.split, mode='fa2cf')
-        self.test_dataset = RealDatasetWrapper(test_base)
+        train_base = CFFADataset(root_dir=str(test_data_dir), split='train', mode='fa2cf')
+        val_base = CFFADataset(root_dir=str(test_data_dir), split='val', mode='fa2cf')
+        
+        train_wrapped = RealDatasetWrapper(train_base)
+        val_wrapped = RealDatasetWrapper(val_base)
+        self.test_dataset = torch.utils.data.ConcatDataset([train_wrapped, val_wrapped])
+        
+        logger.info(f"CFFA 测试全集: train={len(train_base)} + val={len(val_base)} = {len(self.test_dataset)} samples")
 
     def test_dataloader(self):
         return torch.utils.data.DataLoader(self.test_dataset, shuffle=False, **self.loader_params)
@@ -569,7 +573,7 @@ class TestCallback(Callback):
             try:
                 res_f, orig_f = filter_valid_area(img1_result, img1_gt)
                 mask = (res_f > 0)
-                mse = np.mean(((res_f[mask]/255.)-(orig_f[mask]/255.))**2) if np.any(mask) else 0.0
+                mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
             except:
                 mse = 0.0
             mses.append(mse)

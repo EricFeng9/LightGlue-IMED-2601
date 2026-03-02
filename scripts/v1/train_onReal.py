@@ -587,7 +587,7 @@ class MultimodalValidationCallback(Callback):
             try:
                 res_f, orig_f = filter_valid_area(img1_result, img1_gt)
                 mask = (res_f > 0)
-                mse = np.mean(((res_f[mask]/255.)-(orig_f[mask]/255.))**2) if np.any(mask) else 0.0
+                mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
             except:
                 mse = 0.0
             mses.append(mse)
