@@ -261,18 +261,12 @@ class MultimodalDataModule(pl.LightningDataModule):
         }
 
     def setup(self, stage=None):
-        # 测试阶段使用 CFFA 全集（训练集 + 测试集）
+        # 测试阶段使用 CFFA 测试集
         script_dir = Path(__file__).parent.parent.parent
         
         test_data_dir = script_dir / 'data' / 'CFFA'
-        train_base = CFFADataset(root_dir=str(test_data_dir), split='train', mode='fa2cf')
-        val_base = CFFADataset(root_dir=str(test_data_dir), split='val', mode='fa2cf')
-        
-        train_wrapped = RealDatasetWrapper(train_base)
-        val_wrapped = RealDatasetWrapper(val_base)
-        self.test_dataset = torch.utils.data.ConcatDataset([train_wrapped, val_wrapped])
-        
-        logger.info(f"CFFA 测试全集: train={len(train_base)} + val={len(val_base)} = {len(self.test_dataset)} samples")
+        test_base = CFFADataset(root_dir=str(test_data_dir), split='val', mode='fa2cf')
+        self.test_dataset = RealDatasetWrapper(test_base)
 
     def test_dataloader(self):
         return torch.utils.data.DataLoader(self.test_dataset, shuffle=False, **self.loader_params)
