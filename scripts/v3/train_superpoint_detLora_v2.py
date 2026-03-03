@@ -389,18 +389,20 @@ class VisualizationCallback(Callback):
         pl_module.train()
     
     def visualize_epoch(self, model, batch, epoch):
-        """可视化一个epoch的结果"""
+        """可视化一个epoch的结果（优化版：减少 VGG 推理次数）"""
         real_img = batch['real'][0:1]  # [1, 1, H, W]
         fake_img = batch['fake'][0:1]
         seg_mask = batch['seg'][0:1]
         
-        # 提取特征
-        feats_real = model.forward(real_img)
-        feats_fake = model.forward(fake_img)
+        _, _, img_H, img_W = real_img.shape
         
-        # 获取密集描述子
+        # 1. 获取密集描述子（带有 LoRA 梯度）
         dense_desc_real = model.get_dense_descriptors(real_img)
         dense_desc_fake = model.get_dense_descriptors(fake_img)
+        
+        # 2. 只提取 Real 图像的关键点作为锚点（减少 1 次 VGG）
+        with torch.no_grad():
+            feats_real = model.forward(real_img)
         
         # 转换为numpy
         real_np = (real_img[0, 0].cpu().numpy() * 255).astype(np.uint8)
@@ -408,13 +410,31 @@ class VisualizationCallback(Callback):
         seg_np = (seg_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
         
         kpts_real = feats_real['keypoints'][0].cpu().numpy()
-        kpts_fake = feats_fake['keypoints'][0].cpu().numpy()
         
         # 过滤padding
         valid_real = (kpts_real.sum(axis=1) > 0)
-        valid_fake = (kpts_fake.sum(axis=1) > 0)
         kpts_real = kpts_real[valid_real]
-        kpts_fake = kpts_fake[valid_fake]
+        
+        # 使用 Real 的关键点在 Fake 密集描述子上采样，用于可视化 Fake 图像上的匹配点
+        kpts_real_tensor = torch.from_numpy(kpts_real).to(real_img.device)
+        if len(kpts_real) > 0:
+            # 在 Fake 图像上采样描述子，计算与 Real 的相似度
+            desc_real_sampled = model.sample_descriptors_at_keypoints(
+                dense_desc_real[0:1], kpts_real_tensor, img_H, img_W
+            )
+            desc_fake_sampled = model.sample_descriptors_at_keypoints(
+                dense_desc_fake[0:1], kpts_real_tensor, img_H, img_W
+            )
+            
+            # 计算相似度
+            with torch.no_grad():
+                sim = (desc_real_sampled * desc_fake_sampled).sum(dim=1).cpu().numpy()
+            
+            # 只显示高相似度的点
+            high_sim_mask = sim > 0.5
+            kpts_real_display = kpts_real[high_sim_mask]
+        else:
+            kpts_real_display = kpts_real
         
         # 创建可视化
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -425,10 +445,10 @@ class VisualizationCallback(Callback):
         axes[0, 0].set_title(f'Real Image + Keypoints ({len(kpts_real)})')
         axes[0, 0].axis('off')
         
-        # 2. Fake图像 + 关键点
+        # 2. Fake图像 + 匹配的关键点（使用 Real 的锚点）
         axes[0, 1].imshow(fake_np, cmap='gray')
-        axes[0, 1].scatter(kpts_fake[:, 0], kpts_fake[:, 1], c='blue', s=10, alpha=0.5)
-        axes[0, 1].set_title(f'Fake Image + Keypoints ({len(kpts_fake)})')
+        axes[0, 1].scatter(kpts_real_display[:, 0], kpts_real_display[:, 1], c='blue', s=10, alpha=0.5)
+        axes[0, 1].set_title(f'Fake Image + Matched Keypoints ({len(kpts_real_display)})')
         axes[0, 1].axis('off')
         
         # 3. 血管分割图
