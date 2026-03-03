@@ -250,19 +250,20 @@ class SuperPointLoRATrainer(pl.LightningModule):
         return avg_loss
     
     def validation_step(self, batch, batch_idx):
-        """验证步骤"""
+        """验证步骤（优化版：只使用 Real 关键点）"""
         real_img = batch['real']
         fake_img = batch['fake']
         seg_mask = batch['seg']
         
-        B = real_img.shape[0]
+        B, _, img_H, img_W = real_img.shape
         
+        # 1. 带有梯度的密集描述子
         dense_desc_real = self.get_dense_descriptors(real_img)
         dense_desc_fake = self.get_dense_descriptors(fake_img)
         
+        # 2. 冻结提取关键点：只提取 REAL 图像的关键点
         with torch.no_grad():
             feats_real = self.forward(real_img)
-            feats_fake = self.forward(fake_img)
         
         total_loss = 0.0
         num_valid_samples = 0
@@ -277,7 +278,6 @@ class SuperPointLoRATrainer(pl.LightningModule):
                     'fake_img': fake_img[0],
                     'seg_mask': seg_mask[0],
                     'feats_real': {k: v[0] for k, v in feats_real.items()},
-                    'feats_fake': {k: v[0] for k, v in feats_fake.items()},
                     'dense_desc_real': dense_desc_real[0],
                     'dense_desc_fake': dense_desc_fake[0],
                 }
@@ -285,48 +285,41 @@ class SuperPointLoRATrainer(pl.LightningModule):
         
         for i in range(B):
             kpts_real = feats_real['keypoints'][i]
-            kpts_fake = feats_fake['keypoints'][i]
             seg = seg_mask[i]
             
+            # 过滤掉无效的 padding 点
             valid_real = (kpts_real.sum(dim=1) > 0)
-            valid_fake = (kpts_fake.sum(dim=1) > 0)
-            
             kpts_real = kpts_real[valid_real]
-            kpts_fake = kpts_fake[valid_fake]
             
-            if len(kpts_real) == 0 and len(kpts_fake) == 0:
+            if len(kpts_real) < 10:
                 continue
             
-            merged_kpts = self.merge_and_deduplicate_keypoints(kpts_real, kpts_fake)
+            # 核心：仅使用 Real 的关键点作为绝对物理锚点
+            anchor_kpts = kpts_real
             
-            if len(merged_kpts) == 0:
-                continue
-            
+            # 根据血管分割图进行过滤
             if self.vessel_only:
-                vessel_idx = self.filter_keypoints_by_vessel(merged_kpts, seg)
-                
+                vessel_idx = self.filter_keypoints_by_vessel(anchor_kpts, seg)
                 if len(vessel_idx) < 10:
                     continue
-                
-                merged_kpts = merged_kpts[vessel_idx]
+                anchor_kpts = anchor_kpts[vessel_idx]
             
-            if len(merged_kpts) < 10:
-                continue
+            total_keypoints += len(anchor_kpts)
             
-            total_keypoints += len(merged_kpts)
-            
+            # 在 Real 和 Fake 的密集特征图上，根据相同的物理锚点采样描述子
             desc_real_sampled = self.sample_descriptors_at_keypoints(
-                dense_desc_real[i:i+1], merged_kpts
+                dense_desc_real[i:i+1], anchor_kpts, img_H, img_W
             )
             
             desc_fake_sampled = self.sample_descriptors_at_keypoints(
-                dense_desc_fake[i:i+1], merged_kpts
+                dense_desc_fake[i:i+1], anchor_kpts, img_H, img_W
             )
             
+            # 计算带安全半径的 InfoNCE Loss
             loss = self.compute_infonce_loss_with_safe_radius(
                 desc_real_sampled,
                 desc_fake_sampled,
-                merged_kpts,
+                anchor_kpts,
                 temperature=self.temperature
             )
             
@@ -339,7 +332,7 @@ class SuperPointLoRATrainer(pl.LightningModule):
             avg_loss = total_loss / num_valid_samples
         
         self.log('val/loss', avg_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, logger=True)
-        self.log('val/num_keypoints', total_keypoints / max(num_valid_samples, 1), on_step=False, on_epoch=True, sync_dist=True, logger=True)
+        self.log('val/num_keypoints', float(total_keypoints) / max(num_valid_samples, 1), on_step=False, on_epoch=True, sync_dist=True, logger=True)
         
         return {'val_loss': avg_loss}
     
