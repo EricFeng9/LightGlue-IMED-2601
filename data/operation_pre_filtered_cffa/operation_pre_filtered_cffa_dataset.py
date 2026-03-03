@@ -146,17 +146,38 @@ class CFFADataset(Dataset):
                         'cf_pts': cf_pts
                     })
         
-        # 2. 8:2 随机划分 (固定种子以保证可复现)
-        random.Random(42).shuffle(all_samples)
-        num_total = len(all_samples)
-        num_train = int(num_total * 0.8)
+        # 2. 按眼底编号分组，然后按组划分训练集和测试集
+        # 提取眼底编号（文件名中下划线前的部分，如 063_02 -> 063）
+        fundus_groups = {}
+        for sample in all_samples:
+            # 从路径中提取眼底编号
+            subdir_name = os.path.basename(os.path.dirname(sample['fa_path']))
+            fundus_id = subdir_name.split('_')[0]  # 例如 "063_02" -> "063"
+            
+            if fundus_id not in fundus_groups:
+                fundus_groups[fundus_id] = []
+            fundus_groups[fundus_id].append(sample)
         
+        # 按眼底ID排序并随机划分（固定种子以保证可复现）
+        fundus_ids = sorted(fundus_groups.keys())
+        random.Random(42).shuffle(fundus_ids)
+        
+        num_total_fundus = len(fundus_ids)
+        num_train_fundus = int(num_total_fundus * 0.8)
+        
+        train_fundus_ids = set(fundus_ids[:num_train_fundus])
+        test_fundus_ids = set(fundus_ids[num_train_fundus:])
+        
+        # 根据眼底ID分配样本
         if split == 'train':
-            self.samples = all_samples[:num_train]
-        else: # val or test
-            self.samples = all_samples[num_train:]
+            for fundus_id in train_fundus_ids:
+                self.samples.extend(fundus_groups[fundus_id])
+        else:  # val or test
+            for fundus_id in test_fundus_ids:
+                self.samples.extend(fundus_groups[fundus_id])
         
-        print(f"[CFFADataset] {split} set: {len(self.samples)} samples (total {num_total})")
+        num_total = len(all_samples)
+        print(f"[CFFADataset] {split} set: {len(self.samples)} samples from {len(fundus_ids) - num_train_fundus if split != 'train' else num_train_fundus} fundus images (total {num_total} samples, {num_total_fundus} fundus images)")
 
     def __len__(self):
         return len(self.samples)

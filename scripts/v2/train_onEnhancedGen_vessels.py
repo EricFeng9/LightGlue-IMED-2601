@@ -38,14 +38,13 @@ spec.loader.exec_module(multimodal_dataset_module)
 MultiModalDataset = multimodal_dataset_module.MultiModalDataset
 
 # 导入真实数据集（用于验证）
-from data.CFFA.cffa_dataset import CFFADataset
+from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
 
-# 导入指标计算模块
-from scripts.v1.metrics import (
-    compute_homography_errors, 
-    aggregate_metrics,
-    set_metrics_verbose
-)
+# 导入统一的测试/验证模块
+from scripts.v2.test import UnifiedEvaluator
+
+# 导入图像级域随机化模块
+from scripts.v2.gen_data_enhance import random_domain_augment_image
 
 # ==========================================
 # 配置函数
@@ -153,8 +152,10 @@ def create_chessboard(img1, img2, grid_size=4):
 # 辅助类: GenDatasetWrapper (格式转换，适配 260227_2_v29_2_1 数据集)
 # ==========================================
 class GenDatasetWrapper(torch.utils.data.Dataset):
-    def __init__(self, base_dataset):
+    def __init__(self, base_dataset, apply_domain_randomization=True, dr_probability=0.5):
         self.base_dataset = base_dataset
+        self.apply_domain_randomization = apply_domain_randomization
+        self.dr_probability = dr_probability  # 50%的图像对应用域随机化
         
     def __len__(self):
         return len(self.base_dataset)
@@ -170,23 +171,23 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
         
         data = self.base_dataset[idx]
         
-        # 新数据集的逻辑：
-        # - image0 (CF) 是固定图
-        # - image1 (FA deformed) 是应用随机变换后的移动图
-        # - T_0to1 是 H_forward，表示从 CF 坐标系到 FA deformed 坐标系的变换
-        # 
-        # 为了适配训练代码，我们需要：
-        # - image0: 固定图 (CF)
-        # - image1: 未配准的移动图 (FA deformed)
-        # - image1_gt: 配准后的目标 (使用 image0 作为参考，因为 CF 和原始 FA 应该对齐)
-        # - T_0to1: 从 image0 到 image1 的变换
+        # 获取图像
+        image0 = data['image0']  # [1, H, W] CF (固定图)
+        image1 = data['image1']  # [1, H, W] FA deformed (未配准的移动图)
         
-        # 直接使用新数据集的输出，添加 image1_gt 字段
-        # 由于新数据集中 CF 和原始 FA 是对齐的，我们用 image0 作为 image1_gt 的参考
+        # 【核心修改】50%概率应用图像级域随机化
+        # 每张图像独立应用不同的域随机化参数
+        if self.apply_domain_randomization and torch.rand(1).item() < self.dr_probability:
+            # 对 image0 和 image1 分别应用不同的域随机化
+            # 注意：每次调用 random_domain_augment_image 都会使用不同的随机参数
+            image0 = random_domain_augment_image(image0)  # 独立的随机化参数
+            image1 = random_domain_augment_image(image1)  # 独立的随机化参数
+        
+        # 构建返回结果
         result = {
-            'image0': data['image0'],          # [1, H, W] CF (固定图)
-            'image1': data['image1'],          # [1, H, W] FA deformed (未配准的移动图)
-            'image1_gt': data['image0'],       # [1, H, W] 使用 CF 作为配准目标
+            'image0': image0,                  # [1, H, W] CF (固定图，可能已域随机化)
+            'image1': image1,                  # [1, H, W] FA deformed (未配准的移动图，可能已域随机化)
+            'image1_gt': data['image0'],       # [1, H, W] 使用原始 CF 作为配准目标
             'T_0to1': data['T_0to1'],          # [3, 3] 变换矩阵
             'pair_names': data['pair_names'],
             'dataset_name': data['dataset_name']
@@ -202,8 +203,9 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
 # 辅助类: RealDatasetWrapper (格式转换，用于真实数据验证)
 # ==========================================
 class RealDatasetWrapper(torch.utils.data.Dataset):
-    def __init__(self, base_dataset):
+    def __init__(self, base_dataset, split_name='unknown'):
         self.base_dataset = base_dataset
+        self.split_name = split_name
         
     def __len__(self):
         return len(self.base_dataset)
@@ -250,7 +252,8 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
             'image1_gt': moving_gray,
             'T_0to1': T_fix_to_moving,
             'pair_names': (fix_name, moving_name),
-            'dataset_name': 'MultiModal'
+            'dataset_name': 'MultiModal',
+            'split': self.split_name  # 添加 split 信息
         }
 
 class MultimodalDataModule(pl.LightningDataModule):
@@ -267,19 +270,20 @@ class MultimodalDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
             # 训练集使用生成数据 (260227_2_v29_2_1)
-            # 验证集使用真实数据 (operation_pre_filtered_cffa)
+            # 验证集使用 operation_pre_filtered_cffa 测试集
             # 使用绝对路径确保在任何目录下运行都能找到数据
             script_dir = Path(__file__).parent.parent.parent
             
-            # 训练集：生成数据
+            # 训练集：生成数据（50%概率应用图像级域随机化）
             train_data_dir = script_dir / 'data' / '260227_2_v29_2_1'
             train_base = MultiModalDataset(root_dir=str(train_data_dir), split='train', mode='cffa', img_size=self.args.img_size)
-            self.train_dataset = GenDatasetWrapper(train_base)
+            self.train_dataset = GenDatasetWrapper(train_base, apply_domain_randomization=True, dr_probability=0.5)
             
-            # 验证集：真实数据
-            val_data_dir = script_dir / 'data' / 'CFFA'
-            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='cf2fa')
-            self.val_dataset = RealDatasetWrapper(val_base)
+            # 验证集：operation_pre_filtered_cffa 测试集
+            val_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
+            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='fa2cf')
+            self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
+            logger.info(f"验证集加载 operation_pre_filtered_cffa 测试集: {len(self.val_dataset)} 样本")
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
@@ -313,8 +317,8 @@ class PL_LightGlue_Gen(pl.LightningModule):
         # 课程学习权重（由 CurriculumScheduler 动态调整）
         self.vessel_loss_weight = 10.0
         
-        # 用于跨 batch 累积 AUC，在 on_validation_epoch_end 中聚合
-        self._val_step_aucs = []  # list of (auc5, auc10, auc20)
+        # 使用统一的评估器
+        self.evaluator = UnifiedEvaluator(mode='gen', config=config)
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -335,7 +339,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
         }
 
     def forward(self, batch):
-        """前向传播"""
+        """前向传播（不再使用特征级域随机化）"""
         # 提取特征
         with torch.no_grad():
             if 'keypoints0' not in batch:
@@ -350,7 +354,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
                     'scores1': feats1['keypoint_scores']
                 })
         
-        # LightGlue 匹配
+        # LightGlue 匹配（不再应用特征级域随机化）
         data = {
             'image0': {
                 'keypoints': batch['keypoints0'],
@@ -459,103 +463,43 @@ class PL_LightGlue_Gen(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        """验证步骤（兼容 metrics.py）"""
+        """验证步骤（使用统一的评估器）"""
         outputs = self(batch)
         
         # 计算验证损失
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        vessel_mask0 = batch.get('vessel_mask0', None)
+        loss = self._compute_loss(
+            outputs, 
+            batch['keypoints0'], 
+            batch['keypoints1'], 
+            batch['T_0to1'],
+            vessel_mask0
+        )
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         
-        # 获取预测的匹配对
-        matches0 = outputs['matches0']
-        kpts0 = batch['keypoints0']
-        kpts1 = batch['keypoints1']
+        # 使用统一的评估器
+        result = self.evaluator.evaluate_batch(batch, outputs, self)
         
-        B = kpts0.shape[0]
-        H_ests = []
-        
-        # 构建用于 metrics.py 的数据格式
-        mkpts0_f_list = []
-        mkpts1_f_list = []
-        m_bids_list = []
-        
-        # 为每张图计算单应矩阵
-        for b in range(B):
-            m0 = matches0[b]
-            valid = m0 > -1
-            m_indices_0 = torch.where(valid)[0]
-            m_indices_1 = m0[valid]
-            
-            pts0 = kpts0[b][m_indices_0].cpu().numpy()
-            pts1 = kpts1[b][m_indices_1].cpu().numpy()
-            
-            # 保存匹配点（用于 metrics.py 计算 AUC）
-            if len(pts0) > 0:
-                mkpts0_f_list.append(torch.from_numpy(pts0).float())
-                mkpts1_f_list.append(torch.from_numpy(pts1).float())
-                m_bids_list.append(torch.full((len(pts0),), b, dtype=torch.long))
-            
-            if len(pts0) >= 4:
-                try:
-                    H, _ = cv2.findHomography(pts0, pts1, cv2.RANSAC, self.config.TRAINER.RANSAC_PIXEL_THR)
-                    if H is None:
-                        H = np.eye(3)
-                except:
-                    H = np.eye(3)
-            else:
-                H = np.eye(3)
-            H_ests.append(H)
-        
-        # 构建 metrics.py 需要的 batch 格式
-        metrics_batch = {
-            'mkpts0_f': torch.cat(mkpts0_f_list, dim=0) if mkpts0_f_list else torch.empty(0, 2),
-            'mkpts1_f': torch.cat(mkpts1_f_list, dim=0) if mkpts1_f_list else torch.empty(0, 2),
-            'm_bids': torch.cat(m_bids_list, dim=0) if m_bids_list else torch.empty(0, dtype=torch.long),
-            'T_0to1': batch['T_0to1'],
-            'image0': batch['image0'],
-            'dataset_name': batch['dataset_name']
-        }
-        
-        # 使用 metrics.py 计算指标
-        set_metrics_verbose(True)  # 验证时输出详细日志
-        compute_homography_errors(metrics_batch, self.config)
-        
-        # 提取 AUC 指标
-        from scripts.v1.metrics import error_auc
-        if len(metrics_batch.get('t_errs', [])) > 0:
-            auc_dict = error_auc(metrics_batch['t_errs'], [5, 10, 20])
-            # 存入列表，由 on_validation_epoch_end 聚合后统一 log
-            self._val_step_aucs.append((
-                auc_dict.get('auc@5', 0.0),
-                auc_dict.get('auc@10', 0.0),
-                auc_dict.get('auc@20', 0.0)
-            ))
-        
-        return {
-            'H_est': H_ests,
-            'kpts0': kpts0,
-            'kpts1': kpts1,
-            'matches0': matches0,
-            'metrics_batch': metrics_batch
-        }
+        return result
 
     def on_validation_epoch_start(self):
-        """每个验证 epoch 开始时重置 AUC 累积列表"""
-        self._val_step_aucs = []
+        """每个验证 epoch 开始时重置评估器"""
+        self.evaluator.reset()
 
     def on_validation_epoch_end(self):
         """在模型自身 hook 中 log combined_auc，确保 EarlyStopping 能找到该指标"""
-        if self._val_step_aucs:
-            auc5_mean  = sum(x[0] for x in self._val_step_aucs) / len(self._val_step_aucs)
-            auc10_mean = sum(x[1] for x in self._val_step_aucs) / len(self._val_step_aucs)
-            auc20_mean = sum(x[2] for x in self._val_step_aucs) / len(self._val_step_aucs)
-        else:
-            auc5_mean = auc10_mean = auc20_mean = 0.0
-        combined_auc = (auc5_mean + auc10_mean + auc20_mean) / 3.0
-        self.log('auc@5',        auc5_mean,    on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('auc@10',       auc10_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('auc@20',       auc20_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('combined_auc', combined_auc, on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
+        # 使用统一的评估器计算聚合指标
+        metrics = self.evaluator.compute_epoch_metrics()
+        
+        # Log 所有指标
+        self.log('auc@5',        metrics['auc@5'],        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@10',       metrics['auc@10'],       on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@20',       metrics['auc@20'],       on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('mAUC',         metrics['mAUC'],         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('combined_auc', metrics['combined_auc'], on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
+        self.log('val_mse',      metrics['mse'],          on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('val_mace',     metrics['mace'],         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('inverse_mace', metrics['inverse_mace'], on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
 
 # ==========================================
 # 回调逻辑: MultimodalValidationCallback
@@ -605,9 +549,11 @@ class MultimodalValidationCallback(Callback):
         self.epoch_maces = []
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, None, save_images=False)
-        self.epoch_mses.extend(batch_mses)
-        self.epoch_maces.extend(batch_maces)
+        # 从统一评估器的结果中提取 MSE 和 MACE
+        if 'mses' in outputs:
+            self.epoch_mses.extend(outputs['mses'])
+        if 'maces' in outputs:
+            self.epoch_maces.extend(outputs['maces'])
 
     def on_train_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch + 1
@@ -625,40 +571,26 @@ class MultimodalValidationCallback(Callback):
         self._try_write_csv(epoch)
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        if not self.epoch_mses:
-            return
-        
-        avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
-        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else float('inf')
-        
         epoch = trainer.current_epoch + 1
         metrics = trainer.callback_metrics
         
-        display_metrics = {'mse': avg_mse, 'mace': avg_mace}
-        
-        # combined_auc 已由模型的 on_validation_epoch_end 先行 log，这里直接读取
-        for k in ['auc@5', 'auc@10', 'auc@20', 'combined_auc']:
+        # 从 callback_metrics 读取所有指标
+        display_metrics = {}
+        for k in ['val_loss', 'val_mse', 'val_mace', 'auc@5', 'auc@10', 'auc@20', 'mAUC', 'combined_auc', 'inverse_mace']:
             if k in metrics:
                 display_metrics[k] = metrics[k].item()
-            else:
-                display_metrics[k] = 0.0
         
-        if 'val_loss' in metrics:
-            display_metrics['val_loss'] = metrics['val_loss'].item()
-        
-        auc5        = display_metrics.get('auc@5', 0.0)
-        auc10       = display_metrics.get('auc@10', 0.0)
-        auc20       = display_metrics.get('auc@20', 0.0)
+        # 兼容旧的 CSV 格式
+        auc5 = display_metrics.get('auc@5', 0.0)
+        auc10 = display_metrics.get('auc@10', 0.0)
+        auc20 = display_metrics.get('auc@20', 0.0)
         combined_auc = display_metrics.get('combined_auc', 0.0)
-        inverse_mace = 1.0 / (1.0 + avg_mace)
-        
-        # 仅在回调中 log 不涉及早停监控的辅助指标
-        pl_module.log("val_mse",      avg_mse,      on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("val_mace",     avg_mace,     on_epoch=True, prog_bar=False, logger=True)
-        pl_module.log("inverse_mace", inverse_mace, on_epoch=True, prog_bar=False, logger=True)
+        avg_mse = display_metrics.get('val_mse', 0.0)
+        avg_mace = display_metrics.get('val_mace', 0.0)
+        inverse_mace = display_metrics.get('inverse_mace', 0.0)
         
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        logger.info(f"Epoch {epoch} 验证总结 >> {metric_str} | combined_auc: {combined_auc:.4f} | inverse_mace: {inverse_mace:.6f}")
+        logger.info(f"Epoch {epoch} 验证总结 >> {metric_str}")
         
         self.current_val_metrics[epoch] = {
             'mse': avg_mse,
@@ -705,110 +637,110 @@ class MultimodalValidationCallback(Callback):
         
         val_dataloader = trainer.val_dataloaders[0] if isinstance(trainer.val_dataloaders, list) else trainer.val_dataloaders
         pl_module.eval()
+        
+        visualized_count = 0
+        max_visualize = 20  # 最多可视化 20 个测试集样本
+        
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_dataloader):
-                if batch_idx > 5:
-                    break
                 batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 outputs = pl_module.validation_step(batch, batch_idx)
-                self._process_batch(trainer, pl_module, batch, outputs, target_dir, save_images=True)
+                
+                # 只可视化测试集样本
+                batch_size = batch['image0'].shape[0]
+                splits = batch.get('split', ['unknown'] * batch_size)
+                
+                for i in range(batch_size):
+                    sample_split = splits[i] if isinstance(splits, list) else splits
+                    
+                    # 只可视化 test split
+                    if sample_split == 'test':
+                        self._process_batch_sample(trainer, pl_module, batch, outputs, target_dir, i, batch_idx, sample_split)
+                        visualized_count += 1
+                        
+                        if visualized_count >= max_visualize:
+                            break
+                
+                if visualized_count >= max_visualize:
+                    break
+        
+        logger.info(f"已可视化 {visualized_count} 个测试集样本")
         pl_module.force_viz = False
 
-    def _process_batch(self, trainer, pl_module, batch, outputs, epoch_dir, save_images=False):
-        batch_size = batch['image0'].shape[0]
-        mses, maces = [], []
-        H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
-        Ts_gt = batch['T_0to1'].cpu().numpy()
+    def _process_batch_sample(self, trainer, pl_module, batch, outputs, epoch_dir, sample_idx, batch_idx, split):
+        """处理并可视化单个样本"""
+        H_ests = outputs.get('H_est', [np.eye(3)] * batch['image0'].shape[0])
+        H_est = H_ests[sample_idx]
         
-        rejected_count = 0
+        # 启用防爆锁
+        if not is_valid_homography(H_est):
+            H_est = np.eye(3)
         
-        for i in range(batch_size):
-            H_est = H_ests[i]
+        img0 = (batch['image0'][sample_idx, 0].cpu().numpy() * 255).astype(np.uint8)
+        img1 = (batch['image1'][sample_idx, 0].cpu().numpy() * 255).astype(np.uint8)
+        img1_gt = (batch['image1_gt'][sample_idx, 0].cpu().numpy() * 255).astype(np.uint8)
+        
+        h, w = img0.shape
+        try:
+            H_inv = np.linalg.inv(H_est)
+            img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
+        except:
+            img1_result = img1.copy()
+        
+        sample_name = f"batch{batch_idx:04d}_sample{sample_idx:02d}_{split}_{Path(batch['pair_names'][0][sample_idx]).stem}_vs_{Path(batch['pair_names'][1][sample_idx]).stem}"
+        save_path = epoch_dir / sample_name
+        save_path.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(save_path / "fix.png"), img0)
+        cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
+        cv2.imwrite(str(save_path / "moving_gt.png"), img1_gt)
+        
+        # 绘制关键点和匹配
+        img0_color = cv2.cvtColor(img0, cv2.COLOR_GRAY2BGR)
+        img1_color = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
+        
+        if 'kpts0' in outputs and 'kpts1' in outputs:
+            kpts0_np = outputs['kpts0'][sample_idx].cpu().numpy() if hasattr(outputs['kpts0'][sample_idx], 'cpu') else batch['keypoints0'][sample_idx].cpu().numpy()
+            kpts1_np = outputs['kpts1'][sample_idx].cpu().numpy() if hasattr(outputs['kpts1'][sample_idx], 'cpu') else batch['keypoints1'][sample_idx].cpu().numpy()
             
-            # 启用防爆锁
-            if not is_valid_homography(H_est):
-                H_est = np.eye(3)
-                rejected_count += 1
+            # 绘制所有关键点（白色）
+            for pt in kpts0_np:
+                cv2.circle(img0_color, (int(pt[0]), int(pt[1])), 2, (255, 255, 255), -1)
+            for pt in kpts1_np:
+                cv2.circle(img1_color, (int(pt[0]), int(pt[1])), 2, (255, 255, 255), -1)
             
-            img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            img1_gt = (batch['image1_gt'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            
-            h, w = img0.shape
-            try:
-                H_inv = np.linalg.inv(H_est)
-                img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
-            except:
-                img1_result = img1.copy()
-            
-            try:
-                res_f, orig_f = filter_valid_area(img1_result, img1_gt)
-                mask = (res_f > 0)
-                mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
-            except:
-                mse = 0.0
-            mses.append(mse)
-            maces.append(compute_corner_error(H_est, Ts_gt[i], h, w))
-            
-            if save_images:
-                sample_name = f"{Path(batch['pair_names'][0][i]).stem}_vs_{Path(batch['pair_names'][1][i]).stem}"
-                save_path = epoch_dir / sample_name
-                save_path.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(save_path / "fix.png"), img0)
-                cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
+            # 绘制匹配点（红色）
+            if 'matches0' in outputs:
+                m0 = outputs['matches0'][sample_idx].cpu() if hasattr(outputs['matches0'][sample_idx], 'cpu') else outputs['matches0'][sample_idx]
+                valid = m0 > -1
+                m_indices_0 = torch.where(valid)[0].numpy()
+                m_indices_1 = m0[valid].numpy()
                 
-                # 绘制关键点和匹配
-                img0_color = cv2.cvtColor(img0, cv2.COLOR_GRAY2BGR)
-                img1_color = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
+                for idx0 in m_indices_0:
+                    pt = kpts0_np[idx0]
+                    cv2.circle(img0_color, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
+                for idx1 in m_indices_1:
+                    pt = kpts1_np[idx1]
+                    cv2.circle(img1_color, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
                 
-                if 'kpts0' in outputs and 'kpts1' in outputs:
-                    kpts0_np = outputs['kpts0'][i].cpu().numpy()
-                    kpts1_np = outputs['kpts1'][i].cpu().numpy()
-                    
-                    # 绘制所有关键点（白色）
-                    for pt in kpts0_np:
-                        cv2.circle(img0_color, (int(pt[0]), int(pt[1])), 2, (255, 255, 255), -1)
-                    for pt in kpts1_np:
-                        cv2.circle(img1_color, (int(pt[0]), int(pt[1])), 2, (255, 255, 255), -1)
-                    
-                    # 绘制匹配点（红色）
-                    if 'matches0' in outputs:
-                        m0 = outputs['matches0'][i].cpu()
-                        valid = m0 > -1
-                        m_indices_0 = torch.where(valid)[0].numpy()
-                        m_indices_1 = m0[valid].numpy()
-                        
-                        for idx0 in m_indices_0:
-                            pt = kpts0_np[idx0]
-                            cv2.circle(img0_color, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
-                        for idx1 in m_indices_1:
-                            pt = kpts1_np[idx1]
-                            cv2.circle(img1_color, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
-                        
-                        # 使用 viz2d 绘制匹配连线
-                        try:
-                            fig = plt.figure(figsize=(12, 6))
-                            viz2d.plot_images([img0, img1])
-                            if len(m_indices_0) > 0:
-                                viz2d.plot_matches(kpts0_np[m_indices_0], kpts1_np[m_indices_1], color='lime', lw=0.5)
-                            plt.savefig(str(save_path / "matches.png"), bbox_inches='tight', dpi=100)
-                            plt.close(fig)
-                        except Exception as e:
-                            logger.warning(f"绘制匹配图失败: {e}")
-                
-                cv2.imwrite(str(save_path / "fix_with_kpts.png"), img0_color)
-                cv2.imwrite(str(save_path / "moving_with_kpts.png"), img1_color)
-                
+                # 使用 viz2d 绘制匹配连线
                 try:
-                    cb = create_chessboard(img1_result, img0)
-                    cv2.imwrite(str(save_path / "chessboard.png"), cb)
-                except:
-                    pass
+                    fig = plt.figure(figsize=(12, 6))
+                    viz2d.plot_images([img0, img1])
+                    if len(m_indices_0) > 0:
+                        viz2d.plot_matches(kpts0_np[m_indices_0], kpts1_np[m_indices_1], color='lime', lw=0.5)
+                    plt.savefig(str(save_path / "matches.png"), bbox_inches='tight', dpi=100)
+                    plt.close(fig)
+                except Exception as e:
+                    logger.warning(f"绘制匹配图失败: {e}")
         
-        if rejected_count > 0 and save_images:
-            logger.info(f"防爆锁触发: {rejected_count}/{batch_size} 个样本的单应矩阵被重置为单位矩阵")
+        cv2.imwrite(str(save_path / "fix_with_kpts.png"), img0_color)
+        cv2.imwrite(str(save_path / "moving_with_kpts.png"), img1_color)
         
-        return mses, maces
+        try:
+            cb = create_chessboard(img1_result, img0)
+            cv2.imwrite(str(save_path / "chessboard.png"), cb)
+        except:
+            pass
 
 # ==========================================
 # 课程学习调度器
@@ -867,14 +799,24 @@ class DelayedEarlyStopping(EarlyStopping):
 # 参数解析和主函数
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="LightGlue Gen-Data Training with 260227_2_v29_2_1 Dataset")
-    parser.add_argument('--name', '-n', type=str, default='lightglue_gen_baseline', help='训练名称')
+    parser = argparse.ArgumentParser(description="LightGlue Image-Level Domain Randomization (50% probability) + Vessel-Guided Training")
+    parser.add_argument('--name', '-n', type=str, default='260303_img_level_dr_50pct_vessels', help='训练名称')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--img_size', type=int, default=512)
     parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--max_epochs', type=int, default=200)
     parser.add_argument('--gpus', type=str, default='1')
+    
+    # 图像级域随机化参数
+    parser.add_argument('--dr_probability', type=float, default=0.5, help='域随机化应用概率 (默认 0.5 = 50%)')
+    
+    # 课程学习参数
+    parser.add_argument('--teaching_end', type=int, default=50, help='教学期结束 epoch')
+    parser.add_argument('--weaning_end', type=int, default=100, help='断奶期结束 epoch')
+    parser.add_argument('--max_vessel_weight', type=float, default=10.0, help='血管权重最大值')
+    parser.add_argument('--min_vessel_weight', type=float, default=1.0, help='血管权重最小值')
+    
     return parser.parse_args()
 
 def main():
@@ -938,14 +880,22 @@ def main():
     
     # 课程学习调度器
     curriculum_callback = CurriculumScheduler(
-        teaching_end=20,
-        weaning_end=50,
-        max_weight=10.0,
-        min_weight=1.0
+        teaching_end=args.teaching_end,
+        weaning_end=args.weaning_end,
+        max_weight=args.max_vessel_weight,
+        min_weight=args.min_vessel_weight
     )
     
-    logger.info("早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
-    logger.info("课程学习配置: Teaching[0-20]=10.0, Weaning[20-50]=10.0->1.0, Independence[50+]=1.0")
+    logger.info("=" * 80)
+    logger.info("【图像级域随机化 (50%概率) + 血管引导训练】")
+    logger.info("=" * 80)
+    logger.info(f"域随机化应用概率: {args.dr_probability * 100}%")
+    logger.info(f"域随机化策略: 每张图像独立应用不同的随机化参数")
+    logger.info(f"课程学习配置: Teaching[0-{args.teaching_end}]={args.max_vessel_weight}, "
+                f"Weaning[{args.teaching_end}-{args.weaning_end}]={args.max_vessel_weight}->{args.min_vessel_weight}, "
+                f"Independence[{args.weaning_end}+]={args.min_vessel_weight}")
+    logger.info(f"早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
+    logger.info("=" * 80)
     
     # 确保 args 有 mode 属性（用于回调）
     if not hasattr(args, 'mode'):
@@ -979,7 +929,8 @@ def main():
     # 如果指定了检查点，从检查点恢复
     ckpt_path = args.start_point if args.start_point else None
     
-    logger.info(f"开始混合训练 (训练集: 260227_2_v29_2_1 生成数据 | 验证集: CFFA 真实数据): {args.name}")
+    logger.info(f"开始训练 (训练集: 260227_2_v29_2_1 生成数据 | 验证集: CFFA 真实数据): {args.name}")
+    logger.info("策略: 图像级域随机化（50%概率，每张图像独立应用不同的随机化参数）")
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
 if __name__ == '__main__':

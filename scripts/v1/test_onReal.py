@@ -34,7 +34,9 @@ from data.CFFA.cffa_dataset import CFFADataset as CFFADataset_Val
 from scripts.v1.metrics import (
     compute_homography_errors, 
     aggregate_metrics,
-    set_metrics_verbose
+    set_metrics_verbose,
+    error_auc,
+    compute_auc_rop
 )
 
 # ==========================================
@@ -210,7 +212,7 @@ class MultimodalDataModule(pl.LightningDataModule):
         script_dir = Path(__file__).parent.parent.parent
         
         test_data_dir = script_dir / 'data' / 'CFFA'
-        test_base = CFFADataset_Val(root_dir=str(test_data_dir), split='val', mode='fa2cf')
+        test_base = CFFADataset_Val(root_dir=str(test_data_dir), split='val', mode='cf2fa')
         self.test_dataset = RealDatasetWrapper(test_base)
 
     def test_dataloader(self):
@@ -239,8 +241,8 @@ class PL_LightGlue_Real(pl.LightningModule):
         # 用于控制是否强制可视化
         self.force_viz = False
         
-        # 用于跨 batch 累积 AUC，在 on_test_epoch_end 中聚合（与训练验证逻辑一致）
-        self._test_step_aucs = []  # list of (auc5, auc10, auc20)
+        # 用于跨 batch 累积指标，在 on_test_epoch_end 中聚合
+        self._test_step_errors = []  # list of errors for AUC calculation
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -391,15 +393,9 @@ class PL_LightGlue_Real(pl.LightningModule):
         set_metrics_verbose(True)  # 测试时输出详细日志
         compute_homography_errors(metrics_batch, self.config)
         
-        # 提取 AUC 指标（与训练验证逻辑一致：累积到列表，由 on_test_epoch_end 聚合）
-        from scripts.v1.metrics import error_auc
+        # 累积误差用于后续 AUC 计算
         if len(metrics_batch.get('t_errs', [])) > 0:
-            auc_dict = error_auc(metrics_batch['t_errs'], [5, 10, 20])
-            self._test_step_aucs.append((
-                auc_dict.get('auc@5', 0.0),
-                auc_dict.get('auc@10', 0.0),
-                auc_dict.get('auc@20', 0.0)
-            ))
+            self._test_step_errors.extend(metrics_batch['t_errs'])
         
         return {
             'H_est': H_ests,
@@ -410,21 +406,30 @@ class PL_LightGlue_Real(pl.LightningModule):
         }
 
     def on_test_epoch_start(self):
-        """每个测试 epoch 开始时重置 AUC 累积列表"""
-        self._test_step_aucs = []
+        """每个测试 epoch 开始时重置误差累积列表"""
+        self._test_step_errors = []
 
     def on_test_epoch_end(self):
-        """在模型自身 hook 中聚合并 log AUC（与训练验证逻辑完全一致）"""
-        if self._test_step_aucs:
-            auc5_mean  = sum(x[0] for x in self._test_step_aucs) / len(self._test_step_aucs)
-            auc10_mean = sum(x[1] for x in self._test_step_aucs) / len(self._test_step_aucs)
-            auc20_mean = sum(x[2] for x in self._test_step_aucs) / len(self._test_step_aucs)
+        """在模型自身 hook 中聚合并 log AUC（按照 metrics.py 的方式）"""
+        if self._test_step_errors and len(self._test_step_errors) > 0:
+            # 使用 metrics.py 的 error_auc 函数计算 AUC@5, AUC@10, AUC@20
+            auc_dict = error_auc(self._test_step_errors, [5, 10, 20])
+            auc5 = auc_dict.get('auc@5', 0.0)
+            auc10 = auc_dict.get('auc@10', 0.0)
+            auc20 = auc_dict.get('auc@20', 0.0)
+            
+            # 使用 metrics.py 的 compute_auc_rop 函数计算 mAUC
+            mauc_dict = compute_auc_rop(self._test_step_errors, limit=25)
+            mauc = mauc_dict.get('mAUC', 0.0)
         else:
-            auc5_mean = auc10_mean = auc20_mean = 0.0
-        combined_auc = (auc5_mean + auc10_mean + auc20_mean) / 3.0
-        self.log('auc@5',        auc5_mean,    on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('auc@10',       auc10_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('auc@20',       auc20_mean,   on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            auc5 = auc10 = auc20 = mauc = 0.0
+        
+        combined_auc = (auc5 + auc10 + auc20) / 3.0
+        
+        self.log('auc@5',        auc5,         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@10',       auc10,        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('auc@20',       auc20,        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('mAUC',         mauc,         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('combined_auc', combined_auc, on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
 
 # ==========================================
@@ -438,17 +443,21 @@ class TestCallback(Callback):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_mses = []
         self.epoch_maces = []
+        self.total_samples = 0
+        self.failed_samples = 0
 
         import csv
         self.csv_path = self.output_dir / "test_metrics.csv"
         with open(self.csv_path, "w", newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Batch", "Test Loss", "MSE", "MACE", "AUC@5", "AUC@10", "AUC@20"])
+            writer.writerow(["Batch", "Test Loss", "MSE", "MACE", "AUC@5", "AUC@10", "AUC@20", "mAUC", "Match Failure Rate"])
 
     def on_test_epoch_start(self, trainer, pl_module):
         self.epoch_mses = []
         self.epoch_maces = []
         self.batch_metrics = []
+        self.total_samples = 0
+        self.failed_samples = 0
 
     def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, batch_idx, save_images=True)
@@ -456,39 +465,54 @@ class TestCallback(Callback):
         self.epoch_maces.extend(batch_maces)
 
     def on_test_epoch_end(self, trainer, pl_module):
-        if not self.epoch_mses:
+        if self.total_samples == 0:
             logger.warning("没有收集到任何测试指标")
             return
         
-        avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
-        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else float('inf')
+        # 只在匹配成功的样本上计算 MSE 和 MACE
+        avg_mse = sum(self.epoch_mses) / len(self.epoch_mses) if self.epoch_mses else 0.0
+        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else 0.0
+        
+        # 计算匹配失败率
+        match_failure_rate = self.failed_samples / self.total_samples if self.total_samples > 0 else 0.0
         
         metrics = trainer.callback_metrics
         
-        display_metrics = {'mse': avg_mse, 'mace': avg_mace}
+        display_metrics = {
+            'mse': avg_mse, 
+            'mace': avg_mace,
+            'match_failure_rate': match_failure_rate
+        }
         
-        # 直接从模型累积的 _test_step_aucs 计算 AUC（避免 callback_metrics 时序问题）
-        if hasattr(pl_module, '_test_step_aucs') and pl_module._test_step_aucs:
-            aucs = pl_module._test_step_aucs
-            auc5  = sum(x[0] for x in aucs) / len(aucs)
-            auc10 = sum(x[1] for x in aucs) / len(aucs)
-            auc20 = sum(x[2] for x in aucs) / len(aucs)
+        # 直接从模型累积的 _test_step_errors 计算 AUC（避免 callback_metrics 时序问题）
+        if hasattr(pl_module, '_test_step_errors') and pl_module._test_step_errors:
+            errors = pl_module._test_step_errors
+            auc_dict = error_auc(errors, [5, 10, 20])
+            auc5 = auc_dict.get('auc@5', 0.0)
+            auc10 = auc_dict.get('auc@10', 0.0)
+            auc20 = auc_dict.get('auc@20', 0.0)
+            
+            mauc_dict = compute_auc_rop(errors, limit=25)
+            mauc = mauc_dict.get('mAUC', 0.0)
         else:
-            auc5 = auc10 = auc20 = 0.0
+            auc5 = auc10 = auc20 = mauc = 0.0
+        
         combined_auc = (auc5 + auc10 + auc20) / 3.0
         
         display_metrics['auc@5'] = auc5
         display_metrics['auc@10'] = auc10
         display_metrics['auc@20'] = auc20
+        display_metrics['mAUC'] = mauc
         display_metrics['combined_auc'] = combined_auc
         
         if 'test_loss' in metrics:
             display_metrics['test_loss'] = metrics['test_loss'].item()
         
-        inverse_mace = 1.0 / (1.0 + avg_mace)
+        inverse_mace = 1.0 / (1.0 + avg_mace) if avg_mace > 0 else 1.0
         
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        logger.info(f"测试总结 >> {metric_str} | combined_auc: {combined_auc:.4f} | inverse_mace: {inverse_mace:.6f}")
+        logger.info(f"测试总结 >> {metric_str}")
+        logger.info(f"匹配成功样本数: {self.total_samples - self.failed_samples}/{self.total_samples}")
         
         # 保存总结报告
         summary_path = self.output_dir / "test_summary.txt"
@@ -496,11 +520,16 @@ class TestCallback(Callback):
             f.write(f"测试总结\n")
             f.write(f"=" * 50 + "\n")
             f.write(f"测试损失: {display_metrics.get('test_loss', 0.0):.6f}\n")
-            f.write(f"MSE: {avg_mse:.6f}\n")
-            f.write(f"MACE: {avg_mace:.4f}\n")
+            f.write(f"总样本数: {self.total_samples}\n")
+            f.write(f"匹配成功样本数: {self.total_samples - self.failed_samples}\n")
+            f.write(f"匹配失败样本数: {self.failed_samples}\n")
+            f.write(f"匹配失败率: {match_failure_rate:.4f}\n")
+            f.write(f"MSE (仅匹配成功): {avg_mse:.6f}\n")
+            f.write(f"MACE (仅匹配成功): {avg_mace:.4f}\n")
             f.write(f"AUC@5: {auc5:.4f}\n")
             f.write(f"AUC@10: {auc10:.4f}\n")
             f.write(f"AUC@20: {auc20:.4f}\n")
+            f.write(f"mAUC: {mauc:.4f}\n")
             f.write(f"Combined AUC: {combined_auc:.4f}\n")
             f.write(f"Inverse MACE: {inverse_mace:.6f}\n")
         
@@ -515,12 +544,28 @@ class TestCallback(Callback):
         rejected_count = 0
         
         for i in range(batch_size):
+            self.total_samples += 1
             H_est = H_ests[i]
             
-            # 启用防爆锁
+            # 判断是否匹配失败（单应矩阵无效或接近单位矩阵）
+            is_match_failed = False
             if not is_valid_homography(H_est):
                 H_est = np.eye(3)
                 rejected_count += 1
+                is_match_failed = True
+            elif np.allclose(H_est, np.eye(3), atol=1e-3):
+                is_match_failed = True
+            
+            # 检查匹配点数量
+            if 'matches0' in outputs:
+                m0 = outputs['matches0'][i].cpu()
+                valid = m0 > -1
+                num_matches = torch.sum(valid).item()
+                if num_matches < 4:
+                    is_match_failed = True
+            
+            if is_match_failed:
+                self.failed_samples += 1
             
             img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
@@ -533,14 +578,16 @@ class TestCallback(Callback):
             except:
                 img1_result = img1.copy()
             
-            try:
-                res_f, orig_f = filter_valid_area(img1_result, img1_gt)
-                mask = (res_f > 0)
-                mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
-            except:
-                mse = 0.0
-            mses.append(mse)
-            maces.append(compute_corner_error(H_est, Ts_gt[i], h, w))
+            # 只在匹配成功的样本上计算 MSE 和 MACE
+            if not is_match_failed:
+                try:
+                    res_f, orig_f = filter_valid_area(img1_result, img1_gt)
+                    mask = (res_f > 0)
+                    mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
+                except:
+                    mse = 0.0
+                mses.append(mse)
+                maces.append(compute_corner_error(H_est, Ts_gt[i], h, w))
             
             if save_images:
                 sample_name = f"batch{batch_idx:04d}_sample{i:02d}_{Path(batch['pair_names'][0][i]).stem}_vs_{Path(batch['pair_names'][1][i]).stem}"
@@ -601,8 +648,13 @@ class TestCallback(Callback):
                 
                 # 保存单样本指标
                 with open(save_path / "metrics.txt", "w") as f:
-                    f.write(f"MSE: {mse:.6f}\n")
-                    f.write(f"MACE: {maces[-1]:.4f}\n")
+                    f.write(f"Match Failed: {is_match_failed}\n")
+                    if not is_match_failed:
+                        f.write(f"MSE: {mses[-1]:.6f}\n")
+                        f.write(f"MACE: {maces[-1]:.4f}\n")
+                    else:
+                        f.write(f"MSE: N/A (match failed)\n")
+                        f.write(f"MACE: N/A (match failed)\n")
                     f.write(f"Matches: {len(m_indices_0) if 'matches0' in outputs else 0}\n")
         
         if rejected_count > 0:
