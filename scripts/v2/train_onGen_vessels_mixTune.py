@@ -26,9 +26,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from lightglue import LightGlue, SuperPoint
 from lightglue import viz2d
 
-# 导入 SuperPointLoRA
-from scripts.v3.superpoint_detLora import SuperPointLoRA
-
 # 导入生成数据集
 # 注意：由于文件夹名包含点号，需要使用 importlib 动态导入
 import importlib.util
@@ -43,8 +40,8 @@ MultiModalDataset = multimodal_dataset_module.MultiModalDataset
 # 导入真实数据集（用于验证）
 from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
 
-# 导入统一的测试/验证模块（支持 SuperPointLoRA）
-from scripts.v3.test_withLora import UnifiedEvaluator
+# 导入统一的测试/验证模块
+from scripts.v2.test import UnifiedEvaluator
 
 # ==========================================
 # 配置函数
@@ -175,13 +172,17 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
         
         # 构建返回结果
         result = {
-            'image0': image0,                  # [1, H, W] CF (固定图)
-            'image1': image1,                  # [1, H, W] FA deformed (未配准的移动图)
+            'image0': image0,                  # [1, H, W] CF (固定图，干净)
+            'image1': image1,                  # [1, H, W] FA deformed (未配准的移动图，干净)
             'image1_gt': data['image0'],       # [1, H, W] 使用原始 CF 作为配准目标
             'T_0to1': data['T_0to1'],          # [3, 3] 变换矩阵
             'pair_names': data['pair_names'],
             'dataset_name': data['dataset_name']
         }
+        
+        # 添加血管掩码（用于课程学习）
+        if 'vessel_mask0' in data:
+            result['vessel_mask0'] = data['vessel_mask0']
         
         return result
 
@@ -252,26 +253,45 @@ class MultimodalDataModule(pl.LightningDataModule):
             'num_workers': args.num_workers,
             'pin_memory': True
         }
+        self.switch_to_stage2 = False  # 标记是否切换到 Stage 2
+        self.current_stage = 1  # 当前阶段
+        self.stage2_started = False  # 标记 Stage 2 是否已经开始
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
-            # 训练集使用生成数据 (260227_2_v29_2_1)
-            # 验证集使用 operation_pre_filtered_cffa 测试集
-            # 使用绝对路径确保在任何目录下运行都能找到数据
             script_dir = Path(__file__).parent.parent.parent
             
-            # 训练集：生成数据
+            # Stage 1: 训练集使用生成数据 (260227_2_v29_2_1)
             train_data_dir = script_dir / 'data' / '260227_2_v29_2_1'
-            train_base = MultiModalDataset(root_dir=str(train_data_dir), split='train', mode='cffa', img_size=self.args.img_size)
-            self.train_dataset = GenDatasetWrapper(train_base)
+            train_base_gen = MultiModalDataset(root_dir=str(train_data_dir), split='train', mode='cffa', img_size=self.args.img_size)
+            self.train_dataset_gen = GenDatasetWrapper(train_base_gen)
+            logger.info(f"【Stage 1】训练集加载 (生成数据): {len(self.train_dataset_gen)} 样本")
             
-            # 验证集：operation_pre_filtered_cffa 测试集
-            val_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='fa2cf')
+            # Stage 2: 训练集使用真实数据 (operation_pre_filtered_cffa)
+            real_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
+            train_base_real = CFFADataset(root_dir=str(real_data_dir), split='train', mode='cf2fa')
+            self.train_dataset_real = RealDatasetWrapper(train_base_real, split_name='train')
+            logger.info(f"【Stage 2】训练集加载 (真实数据): {len(self.train_dataset_real)} 样本")
+            
+            # 验证集：operation_pre_filtered_cffa 测试集（两阶段共用）
+            val_base = CFFADataset(root_dir=str(real_data_dir), split='val', mode='cf2fa')
             self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
-            logger.info(f"验证集加载 operation_pre_filtered_cffa 测试集: {len(self.val_dataset)} 样本")
+            logger.info(f"验证集加载: {len(self.val_dataset)} 样本")
+            
+            # 初始使用 Stage 1 数据集
+            self.train_dataset = self.train_dataset_gen
 
     def train_dataloader(self):
+        # 检查是否需要切换到 Stage 2
+        if self.switch_to_stage2 and self.current_stage == 1 and not self.stage2_started:
+            self.current_stage = 2
+            self.train_dataset = self.train_dataset_real
+            self.switch_to_stage2 = False  # 重置标记
+            self.stage2_started = True  # 标记 Stage 2 已开始
+            logger.info(f"=" * 80)
+            logger.info(f"【切换到 Stage 2】开始真实数据微调，训练集大小: {len(self.train_dataset)}")
+            logger.info(f"=" * 80)
+        
         return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
 
     def val_dataloader(self):
@@ -282,21 +302,16 @@ class MultimodalDataModule(pl.LightningDataModule):
 # ==========================================
 class PL_LightGlue_Gen(pl.LightningModule):
     """LightGlue 的 PyTorch Lightning 封装（用于生成数据训练）"""
-    def __init__(self, config, result_dir=None, lora_name=None):
+    def __init__(self, config, result_dir=None):
         super().__init__()
         self.config = config
         self.result_dir = result_dir
-        self.lora_name = lora_name
-        self.save_hyperparameters({'config': str(config), 'lora_name': lora_name})
+        self.save_hyperparameters({'config': str(config)})
         
-        # 1. 特征提取器 (SuperPointLoRA) - 冻结
-        self.extractor = SuperPointLoRA(max_num_keypoints=2048, enable_lora=True).eval()
+        # 1. 特征提取器 (SuperPoint) - 冻结
+        self.extractor = SuperPoint(max_num_keypoints=2048).eval()
         for param in self.extractor.parameters():
             param.requires_grad = False
-        
-        # 如果指定了lora_name，加载LoRA权重
-        if self.lora_name is not None:
-            self._load_lora_weights(self.lora_name)
             
         # 2. 匹配器 (LightGlue) - 可训练
         lg_conf = config.MATCHING.copy()
@@ -305,61 +320,11 @@ class PL_LightGlue_Gen(pl.LightningModule):
         # 用于控制是否强制可视化
         self.force_viz = False
         
+        # 课程学习权重（由 CurriculumScheduler 动态调整）
+        self.vessel_loss_weight = 10.0
+        
         # 使用统一的评估器
         self.evaluator = UnifiedEvaluator(mode='gen', config=config)
-    
-    def _load_lora_weights(self, lora_name):
-        """加载LoRA权重
-        
-        Args:
-            lora_name: LoRA训练时保存的name，将加载 results/superpoint_lora/{lora_name}/checkpoints/ 下的best checkpoint
-                      或者 results/superpoint_lora/{lora_name}/final_lora.pth
-        """
-        import glob
-        
-        # 构建LoRA权重路径
-        lora_dir = Path(f"results/superpoint_lora/{lora_name}")
-        
-        # 优先尝试加载best checkpoint
-        checkpoints_dir = lora_dir / "checkpoints"
-        lora_pth_path = None
-        
-        if checkpoints_dir.exists():
-            # 查找best checkpoint
-            ckpt_files = list(checkpoints_dir.glob("*.ckpt"))
-            if ckpt_files:
-                # 加载best checkpoint中的LoRA权重
-                try:
-                    checkpoint = torch.load(ckpt_files[0], map_location='cpu')
-                    if 'model.model.lora_Da.weight' in checkpoint['state_dict']:
-                        # 从checkpoint中提取LoRA权重
-                        lora_state = {}
-                        for key in checkpoint['state_dict']:
-                            if 'lora_Da.' in key or 'lora_Db.' in key:
-                                lora_state[key.replace('model.model.', '')] = checkpoint['state_dict'][key]
-                        
-                        # 手动设置LoRA权重
-                        state_dict_lora_Da = {k.replace('lora_Da.', ''): v for k, v in lora_state.items() if 'lora_Da.' in k}
-                        state_dict_lora_Db = {k.replace('lora_Db.', ''): v for k, v in lora_state.items() if 'lora_Db.' in k}
-                        
-                        self.extractor.lora_Da.load_state_dict(state_dict_lora_Da)
-                        self.extractor.lora_Db.load_state_dict(state_dict_lora_Db)
-                        logger.info(f"从checkpoint加载LoRA权重: {ckpt_files[0]}")
-                        return
-                except Exception as e:
-                    logger.warning(f"从checkpoint加载LoRA权重失败: {e}")
-        
-        # 如果加载checkpoint失败，尝试加载final_lora.pth
-        final_lora_path = lora_dir / "final_lora.pth"
-        if final_lora_path.exists():
-            try:
-                self.extractor.load_lora_weights(str(final_lora_path))
-                logger.info(f"从final_lora.pth加载LoRA权重: {final_lora_path}")
-                return
-            except Exception as e:
-                logger.warning(f"从final_lora.pth加载LoRA权重失败: {e}")
-        
-        logger.warning(f"未找到有效的LoRA权重文件: {lora_dir}")
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -378,6 +343,24 @@ class PL_LightGlue_Gen(pl.LightningModule):
                 "strict": False,
             },
         }
+    
+    def on_train_epoch_start(self):
+        """在每个训练 epoch 开始时检查是否需要调整学习率（Stage 2 切换时）"""
+        # 检查是否刚切换到 Stage 2
+        if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule.current_stage == 2:
+            if not hasattr(self, '_stage2_lr_adjusted'):
+                # 减小学习率为原来的 0.1 倍
+                for param_group in self.optimizers().param_groups:
+                    old_lr = param_group['lr']
+                    new_lr = old_lr * 0.1
+                    param_group['lr'] = new_lr
+                    logger.info(f"【Stage 2 学习率调整】{old_lr:.6f} -> {new_lr:.6f}")
+                self._stage2_lr_adjusted = True
+                
+                # 重置优化器状态（可选，避免 Stage 1 的动量影响 Stage 2）
+                optimizer = self.optimizers()
+                optimizer.state = {}
+                logger.info("【Stage 2】优化器状态已重置")
 
     def forward(self, batch):
         """前向传播"""
@@ -434,8 +417,8 @@ class PL_LightGlue_Gen(pl.LightningModule):
         
         return matches_gt
 
-    def _compute_loss(self, outputs, kpts0, kpts1, T_0to1):
-        """计算负对数似然损失"""
+    def _compute_loss(self, outputs, kpts0, kpts1, T_0to1, vessel_mask0=None):
+        """计算加权负对数似然损失（支持血管引导）"""
         scores = outputs['log_assignment']
         matches_gt = self._compute_gt_matches(kpts0, kpts1, T_0to1)
         
@@ -445,23 +428,85 @@ class PL_LightGlue_Gen(pl.LightningModule):
         targets[targets == -1] = N
         
         target_log_probs = torch.gather(scores[:, :M, :], 2, targets.unsqueeze(2)).squeeze(2)
-        loss = -target_log_probs.mean()
+        
+        # 如果提供了血管掩码，进行加权
+        if vessel_mask0 is not None and self.vessel_loss_weight > 1.0:
+            weights = self._compute_vessel_weights(kpts0, vessel_mask0)
+            weighted_log_probs = target_log_probs * weights
+            loss = -weighted_log_probs.mean()
+        else:
+            loss = -target_log_probs.mean()
         
         return loss
+    
+    def _compute_vessel_weights(self, kpts0, vessel_mask0):
+        """计算基于血管掩码的权重"""
+        B, M, _ = kpts0.shape
+        device = kpts0.device
+        weights = torch.ones(B, M, device=device)
+        
+        for b in range(B):
+            # vessel_mask0: [B, 1, H, W] 或 [B, H, W]
+            if vessel_mask0.dim() == 4:
+                mask = vessel_mask0[b, 0]  # [H, W]
+            else:
+                mask = vessel_mask0[b]  # [H, W]
+            
+            H, W = mask.shape
+            kpts = kpts0[b]  # [M, 2]
+            
+            # 将关键点坐标转换为整数索引
+            x_coords = torch.clamp(kpts[:, 0].long(), 0, W - 1)
+            y_coords = torch.clamp(kpts[:, 1].long(), 0, H - 1)
+            
+            # 检查关键点是否在血管上（mask > 0.5 表示血管）
+            is_on_vessel = mask[y_coords, x_coords] > 0.5
+            
+            # 血管上的点赋予高权重，背景点权重为1.0
+            weights[b, is_on_vessel] = self.vessel_loss_weight
+        
+        return weights
 
     def training_step(self, batch, batch_idx):
-        """训练步骤（生成数据训练）"""
+        """训练步骤（支持两阶段训练）"""
         outputs = self(batch)
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        
+        # 获取血管掩码（如果存在，仅 Stage 1 生成数据有）
+        vessel_mask0 = batch.get('vessel_mask0', None)
+        
+        loss = self._compute_loss(
+            outputs, 
+            batch['keypoints0'], 
+            batch['keypoints1'], 
+            batch['T_0to1'],
+            vessel_mask0
+        )
+        
+        # 记录当前阶段
+        current_stage = self.trainer.datamodule.current_stage if hasattr(self.trainer, 'datamodule') else 1
         
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train/stage', float(current_stage), on_step=False, on_epoch=True, prog_bar=True)
+        
+        # 只在 Stage 1 记录血管权重
+        if current_stage == 1:
+            self.log('train/vessel_weight', self.vessel_loss_weight, on_step=False, on_epoch=True, prog_bar=True)
+        
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """验证步骤（使用统一的评估器）"""
         outputs = self(batch)
         
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        # 计算验证损失
+        vessel_mask0 = batch.get('vessel_mask0', None)
+        loss = self._compute_loss(
+            outputs, 
+            batch['keypoints0'], 
+            batch['keypoints1'], 
+            batch['T_0to1'],
+            vessel_mask0
+        )
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         
         # 使用统一的评估器
@@ -482,7 +527,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
         self.log('auc@5',        metrics['auc@5'],        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('auc@10',       metrics['auc@10'],       on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('auc@20',       metrics['auc@20'],       on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('mAUC',         metrics.get('mAUC', 0.0), on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('mAUC',         metrics['mAUC'],         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('combined_auc', metrics['combined_auc'], on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
         self.log('val_mse',      metrics['mse'],          on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('val_mace',     metrics['mace'],         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
@@ -547,12 +592,15 @@ class MultimodalValidationCallback(Callback):
         metrics = trainer.callback_metrics
         display_metrics = {}
         
+        # 获取当前阶段
+        current_stage = trainer.datamodule.current_stage if hasattr(trainer, 'datamodule') else 1
+        
         if 'train/loss_epoch' in metrics:
             display_metrics['loss'] = metrics['train/loss_epoch'].item()
         
         if display_metrics:
             metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-            logger.info(f"Epoch {epoch} 训练总结 >> {metric_str}")
+            logger.info(f"Epoch {epoch} [Stage {current_stage}] 训练总结 >> {metric_str}")
         
         self.current_train_metrics[epoch] = display_metrics
         self._try_write_csv(epoch)
@@ -560,6 +608,9 @@ class MultimodalValidationCallback(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch + 1
         metrics = trainer.callback_metrics
+        
+        # 获取当前阶段
+        current_stage = trainer.datamodule.current_stage if hasattr(trainer, 'datamodule') else 1
         
         # 从 callback_metrics 读取所有指标
         display_metrics = {}
@@ -577,7 +628,7 @@ class MultimodalValidationCallback(Callback):
         inverse_mace = display_metrics.get('inverse_mace', 0.0)
         
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        logger.info(f"Epoch {epoch} 验证总结 >> {metric_str}")
+        logger.info(f"Epoch {epoch} [Stage {current_stage}] 验证总结 >> {metric_str}")
         
         self.current_val_metrics[epoch] = {
             'mse': avg_mse,
@@ -606,13 +657,14 @@ class MultimodalValidationCallback(Callback):
             trainer.save_checkpoint(best_path / "model.ckpt")
             with open(best_path / "log.txt", "w") as f:
                 f.write(f"Epoch: {epoch}\n")
+                f.write(f"Stage: {current_stage}\n")
                 f.write(f"Best Combined AUC: {combined_auc:.4f}\n")
                 f.write(f"AUC@5: {auc5:.4f}\n")
                 f.write(f"AUC@10: {auc10:.4f}\n")
                 f.write(f"AUC@20: {auc20:.4f}\n")
                 f.write(f"MACE: {avg_mace:.4f}\n")
                 f.write(f"MSE: {avg_mse:.6f}\n")
-            logger.info(f"发现新的最优模型! Epoch {epoch}, Combined AUC: {combined_auc:.4f}")
+            logger.info(f"发现新的最优模型! Epoch {epoch} [Stage {current_stage}], Combined AUC: {combined_auc:.4f}")
 
         if is_best or (epoch % 5 == 0):
             self._trigger_visualization(trainer, pl_module, is_best, epoch)
@@ -730,30 +782,142 @@ class MultimodalValidationCallback(Callback):
             pass
 
 # ==========================================
-# 早停机制
+# 课程学习调度器
 # ==========================================
-class DelayedEarlyStopping(EarlyStopping):
+class CurriculumScheduler(Callback):
+    """
+    血管引导的课程学习调度器（仅在 Stage 1 生效）
+    动态调整 vessel_loss_weight 参数
+    
+    Phase 1 (Teaching): Epoch 0-20 -> Weight 10.0 (强迫关注血管)
+    Phase 2 (Weaning):  Epoch 20-50 -> Weight 10.0 -> 1.0 (线性衰减)
+    Phase 3 (Independence): Epoch 50+ -> Weight 1.0 (正常模式)
+    """
+    def __init__(self, teaching_end=20, weaning_end=50, max_weight=10.0, min_weight=1.0):
+        super().__init__()
+        self.teaching_end = teaching_end
+        self.weaning_end = weaning_end
+        self.max_weight = max_weight
+        self.min_weight = min_weight
+    
+    def on_train_epoch_start(self, trainer, pl_module):
+        # 只在 Stage 1 应用课程学习
+        if hasattr(trainer, 'datamodule') and trainer.datamodule.current_stage == 2:
+            # Stage 2 不使用血管权重
+            if hasattr(pl_module, 'vessel_loss_weight'):
+                pl_module.vessel_loss_weight = 1.0
+            return
+        
+        epoch = trainer.current_epoch
+        
+        if epoch < self.teaching_end:
+            # 教学期：强迫关注血管
+            current_weight = self.max_weight
+            phase = "Teaching"
+        elif epoch < self.weaning_end:
+            # 断奶期：线性衰减
+            progress = (epoch - self.teaching_end) / (self.weaning_end - self.teaching_end)
+            current_weight = self.max_weight - progress * (self.max_weight - self.min_weight)
+            phase = "Weaning"
+        else:
+            # 独立期：自由探索
+            current_weight = self.min_weight
+            phase = "Independence"
+        
+        # 更新模型权重
+        if hasattr(pl_module, 'vessel_loss_weight'):
+            pl_module.vessel_loss_weight = current_weight
+            logger.info(f"Epoch {epoch} [Stage 1 - {phase} Phase]: vessel_loss_weight = {current_weight:.2f}")
+
+# ==========================================
+# 早停机制（支持两阶段训练）
+# ==========================================
+class TwoStageEarlyStopping(EarlyStopping):
+    """
+    两阶段早停机制：
+    - Stage 1: 生成数据训练，触发早停后切换到 Stage 2
+    - Stage 2: 真实数据微调，使用相同的 patience
+    """
     def __init__(self, start_epoch=50, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.start_epoch = start_epoch
+        self.stage1_stopped = False  # 标记 Stage 1 是否已触发早停
+        self.previous_wait_count = 0  # 记录上一次的 wait_count
     
     def on_validation_end(self, trainer, pl_module):
-        if trainer.current_epoch >= self.start_epoch:
+        """验证结束时的回调"""
+        if trainer.current_epoch < self.start_epoch:
+            return
+        
+        # 获取当前阶段
+        current_stage = trainer.datamodule.current_stage if hasattr(trainer, 'datamodule') else 1
+        
+        # 检查监控指标是否存在
+        if self.monitor not in trainer.callback_metrics:
+            logger.warning(f"监控指标 '{self.monitor}' 不在 callback_metrics 中，跳过早停检查")
+            return
+        
+        # 调用父类的早停逻辑
+        try:
             super().on_validation_end(trainer, pl_module)
+        except Exception as e:
+            logger.warning(f"早停检查出错: {e}")
+            return
+        
+        # 检查是否触发了早停（wait_count 达到 patience）
+        if self.wait_count >= self.patience and not self.stage1_stopped and current_stage == 1:
+            self.stage1_stopped = True
+            logger.info("=" * 80)
+            logger.info(f"【Stage 1 早停触发】Epoch {trainer.current_epoch}")
+            logger.info(f"  - 等待次数: {self.wait_count}/{self.patience}")
+            logger.info(f"  - 最佳指标: {self.best_score}")
+            logger.info(f"  - 准备切换到 Stage 2 (真实数据微调)")
+            logger.info("=" * 80)
+            
+            # 加载 Stage 1 的最佳 checkpoint
+            best_ckpt_path = Path(trainer.default_root_dir) / f"lightglue_{trainer.datamodule.args.mode}" / trainer.datamodule.args.name / "best_checkpoint" / "model.ckpt"
+            if best_ckpt_path.exists():
+                logger.info(f"加载 Stage 1 最佳 checkpoint: {best_ckpt_path}")
+                checkpoint = torch.load(best_ckpt_path, map_location=pl_module.device)
+                pl_module.load_state_dict(checkpoint['state_dict'])
+                logger.info("✓ Stage 1 最佳模型权重已加载")
+            else:
+                logger.warning(f"未找到 Stage 1 最佳 checkpoint: {best_ckpt_path}，将使用当前权重继续")
+            
+            # 重置早停计数器，为 Stage 2 做准备
+            self.wait_count = 0
+            self.stopped_epoch = 0
+            self.best_score = None
+            
+            # 关键：阻止训练停止，让它继续到 Stage 2
+            trainer.should_stop = False
+            
+            # 标记需要切换到 Stage 2
+            if hasattr(trainer, 'datamodule'):
+                trainer.datamodule.switch_to_stage2 = True
+                trainer.datamodule.args = trainer.datamodule.args  # 保存 args 引用
+                logger.info("早停计数器已重置，将在下一个 epoch 切换到 Stage 2")
+        
+        self.previous_wait_count = self.wait_count
 
 # ==========================================
 # 参数解析和主函数
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="LightGlue Training on Generated Data with LoRA")
-    parser.add_argument('--name', '-n', type=str, default='260303_gen_baseline', help='训练名称')
-    parser.add_argument('--lora_name', type=str, default=None, help='SuperPoint LoRA训练时保存的name，默认加载该name下的bestcheckpoints')
+    parser = argparse.ArgumentParser(description="LightGlue Two-Stage Training: Generated Data + Real Data Fine-tuning")
+    parser.add_argument('--name', '-n', type=str, default='260303_two_stage', help='训练名称')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--img_size', type=int, default=512)
     parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--max_epochs', type=int, default=200)
     parser.add_argument('--gpus', type=str, default='1')
+    
+    # 课程学习参数（仅 Stage 1）
+    parser.add_argument('--teaching_end', type=int, default=50, help='教学期结束 epoch')
+    parser.add_argument('--weaning_end', type=int, default=100, help='断奶期结束 epoch')
+    parser.add_argument('--max_vessel_weight', type=float, default=10.0, help='血管权重最大值')
+    parser.add_argument('--min_vessel_weight', type=float, default=1.0, help='血管权重最小值')
     
     return parser.parse_args()
 
@@ -797,14 +961,8 @@ def main():
     _scaling = config.TRAINER.TRUE_BATCH_SIZE / config.TRAINER.CANONICAL_BS
     config.TRAINER.TRUE_LR = config.TRAINER.CANONICAL_LR * _scaling
     
-    # 记录LoRA配置
-    if args.lora_name is not None:
-        logger.info(f"加载SuperPoint LoRA权重: {args.lora_name}")
-    else:
-        logger.info("未指定LoRA权重，使用原始SuperPoint（不启用LoRA）")
-    
     # 初始化模型
-    model = PL_LightGlue_Gen(config, result_dir=str(result_dir), lora_name=args.lora_name)
+    model = PL_LightGlue_Gen(config, result_dir=str(result_dir))
     
     # 初始化数据模块
     data_module = MultimodalDataModule(args, config)
@@ -813,7 +971,7 @@ def main():
     tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=f"lightglue_{args.name}")
     
     # 早停配置
-    early_stop_callback = DelayedEarlyStopping(
+    early_stop_callback = TwoStageEarlyStopping(
         start_epoch=0,
         monitor='combined_auc',
         mode='max',
@@ -822,7 +980,28 @@ def main():
         strict=False
     )
     
-    logger.info("早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
+    # 课程学习调度器
+    curriculum_callback = CurriculumScheduler(
+        teaching_end=args.teaching_end,
+        weaning_end=args.weaning_end,
+        max_weight=args.max_vessel_weight,
+        min_weight=args.min_vessel_weight
+    )
+    
+    logger.info("=" * 80)
+    logger.info("【两阶段训练：生成数据 + 真实数据微调】")
+    logger.info("=" * 80)
+    logger.info(f"Stage 1: 生成数据训练 (260227_2_v29_2_1)")
+    logger.info(f"  - 课程学习: Teaching[0-{args.teaching_end}]={args.max_vessel_weight}, "
+                f"Weaning[{args.teaching_end}-{args.weaning_end}]={args.max_vessel_weight}->{args.min_vessel_weight}, "
+                f"Independence[{args.weaning_end}+]={args.min_vessel_weight}")
+    logger.info(f"  - 早停触发后自动切换到 Stage 2")
+    logger.info(f"Stage 2: 真实数据微调 (operation_pre_filtered_cffa)")
+    logger.info(f"  - 学习率: 自动降低为 Stage 1 的 0.1 倍")
+    logger.info(f"  - 早停配置: patience={10}, 与 Stage 1 相同")
+    logger.info(f"验证集: operation_pre_filtered_cffa 测试集")
+    logger.info(f"早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
+    logger.info("=" * 80)
     
     # 确保 args 有 mode 属性（用于回调）
     if not hasattr(args, 'mode'):
@@ -841,6 +1020,7 @@ def main():
         'callbacks': [
             MultimodalValidationCallback(args), 
             LearningRateMonitor(logging_interval='step'), 
+            curriculum_callback,
             early_stop_callback
         ],
         'logger': tb_logger,
@@ -855,7 +1035,10 @@ def main():
     # 如果指定了检查点，从检查点恢复
     ckpt_path = args.start_point if args.start_point else None
     
-    logger.info(f"开始训练 (训练集: 260227_2_v29_2_1 生成数据 | 验证集: CFFA 真实数据): {args.name}")
+    logger.info(f"开始两阶段训练: {args.name}")
+    logger.info("Stage 1: 生成数据训练 (260227_2_v29_2_1) | 验证集: CFFA 真实数据")
+    logger.info("Stage 2: 真实数据微调 (operation_pre_filtered_cffa) | 验证集: CFFA 真实数据")
+    logger.info("策略: 血管loss引导的课程学习 (Stage 1) + 真实数据微调 (Stage 2)")
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
 if __name__ == '__main__':

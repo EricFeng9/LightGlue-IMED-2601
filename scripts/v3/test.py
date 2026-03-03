@@ -11,6 +11,10 @@ import cv2
 import numpy as np
 import torch
 from loguru import logger
+import argparse
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import Callback
 
 # 添加父目录到 sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
@@ -313,3 +317,252 @@ def run_evaluation(pl_module, dataloader, mode='gen', verbose=True):
         logger.info(f"评估完成: {metrics}")
     
     return metrics
+
+
+# ==========================================
+# 测试回调类
+# ==========================================
+class TestCallback(Callback):
+    """测试回调，用于收集和保存测试指标"""
+    def __init__(self, output_dir):
+        super().__init__()
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.all_errors = []
+        self.all_mses = []
+        self.all_maces = []
+        self.total_samples = 0
+        self.failed_samples = 0
+        self.test_loss_sum = 0.0
+        self.test_loss_count = 0
+
+    def on_test_epoch_start(self, trainer, pl_module):
+        """测试开始时重置统计"""
+        self.all_errors = []
+        self.all_mses = []
+        self.all_maces = []
+        self.total_samples = 0
+        self.failed_samples = 0
+        self.test_loss_sum = 0.0
+        self.test_loss_count = 0
+
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        """收集每个batch的指标"""
+        # 收集损失
+        if 'loss' in outputs:
+            self.test_loss_sum += outputs['loss'].item()
+            self.test_loss_count += 1
+        
+        # 收集MSE和MACE
+        if 'mses' in outputs:
+            self.all_mses.extend(outputs['mses'])
+        if 'maces' in outputs:
+            self.all_maces.extend(outputs['maces'])
+        
+        # 收集误差用于AUC计算
+        if 'metrics_batch' in outputs:
+            metrics_batch = outputs['metrics_batch']
+            if 't_errs' in metrics_batch and len(metrics_batch['t_errs']) > 0:
+                self.all_errors.extend(metrics_batch['t_errs'])
+        
+        # 统计样本数
+        batch_size = batch['image0'].shape[0]
+        self.total_samples += batch_size
+        
+        # 统计失败样本
+        if 'matches0' in outputs:
+            matches0 = outputs['matches0']
+            for b in range(batch_size):
+                m0 = matches0[b]
+                valid = m0 > -1
+                num_matches = torch.sum(valid).item()
+                if num_matches < 4:
+                    self.failed_samples += 1
+
+    def on_test_epoch_end(self, trainer, pl_module):
+        """测试结束时计算并保存总结"""
+        # 计算平均损失
+        avg_loss = self.test_loss_sum / self.test_loss_count if self.test_loss_count > 0 else 0.0
+        
+        # 计算MSE和MACE（仅匹配成功的样本）
+        avg_mse = sum(self.all_mses) / len(self.all_mses) if self.all_mses else 0.0
+        avg_mace = sum(self.all_maces) / len(self.all_maces) if self.all_maces else 0.0
+        
+        # 计算AUC指标
+        if self.all_errors and len(self.all_errors) > 0:
+            auc_dict = error_auc(self.all_errors, [5, 10, 20])
+            auc5 = auc_dict.get('auc@5', 0.0)
+            auc10 = auc_dict.get('auc@10', 0.0)
+            auc20 = auc_dict.get('auc@20', 0.0)
+            
+            mauc_dict = compute_auc_rop(self.all_errors, limit=25)
+            mauc = mauc_dict.get('mAUC', 0.0)
+        else:
+            auc5 = auc10 = auc20 = mauc = 0.0
+        
+        combined_auc = (auc5 + auc10 + auc20) / 3.0
+        match_failure_rate = self.failed_samples / self.total_samples if self.total_samples > 0 else 0.0
+        inverse_mace = 1.0 / (1.0 + avg_mace) if avg_mace > 0 else 1.0
+        success_samples = self.total_samples - self.failed_samples
+        
+        # 保存测试总结
+        summary_path = self.output_dir / "test_summary.txt"
+        with open(summary_path, "w") as f:
+            f.write("测试总结\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"测试损失: {avg_loss:.6f}\n")
+            f.write(f"总样本数: {self.total_samples}\n")
+            f.write(f"匹配成功样本数: {success_samples}\n")
+            f.write(f"匹配失败样本数: {self.failed_samples}\n")
+            f.write(f"匹配失败率: {match_failure_rate:.4f}\n")
+            f.write(f"MSE (仅匹配成功): {avg_mse:.6f}\n")
+            f.write(f"MACE (仅匹配成功): {avg_mace:.4f}\n")
+            f.write(f"AUC@5: {auc5:.4f}\n")
+            f.write(f"AUC@10: {auc10:.4f}\n")
+            f.write(f"AUC@20: {auc20:.4f}\n")
+            f.write(f"mAUC: {mauc:.4f}\n")
+            f.write(f"Combined AUC: {combined_auc:.4f}\n")
+            f.write(f"Inverse MACE: {inverse_mace:.6f}\n")
+        
+        logger.info(f"测试总结已保存到: {summary_path}")
+        logger.info(f"测试损失: {avg_loss:.6f}")
+        logger.info(f"MSE: {avg_mse:.6f}, MACE: {avg_mace:.4f}")
+        logger.info(f"AUC@5: {auc5:.4f}, AUC@10: {auc10:.4f}, AUC@20: {auc20:.4f}")
+        logger.info(f"mAUC: {mauc:.4f}, Combined AUC: {combined_auc:.4f}")
+        logger.info(f"匹配失败率: {match_failure_rate:.4f}")
+
+
+# ==========================================
+# 主函数
+# ==========================================
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="LightGlue 统一测试脚本")
+    parser.add_argument('--mode', type=str, required=True, choices=['gen', 'real'], 
+                        help='测试模式: gen (生成数据) 或 real (真实数据)')
+    parser.add_argument('--name', type=str, required=True, 
+                        help='模型名称（用于定位 results/[mode]/[name] 下的 best_checkpoint）')
+    parser.add_argument('--test_name', type=str, required=True, 
+                        help='测试名称（结果保存在 results/[mode]/[name]/[test_name] 下）')
+    parser.add_argument('--checkpoint', type=str, default=None, 
+                        help='检查点路径（默认使用 best_checkpoint/model.ckpt）')
+    parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
+    parser.add_argument('--num_workers', type=int, default=8, help='数据加载线程数')
+    parser.add_argument('--gpus', type=str, default='0', help='GPU设备ID')
+    return parser.parse_args()
+
+
+def main():
+    """主函数"""
+    args = parse_args()
+    
+    # 导入必要的模块（根据mode动态导入）
+    if args.mode == 'gen':
+        # 导入生成数据相关模块
+        from scripts.v2.train_onGen_vessels_mixTune import (
+            PL_LightGlue_Gen, 
+            MultimodalDataModule as GenDataModule,
+            get_default_config
+        )
+        pl_class = PL_LightGlue_Gen
+        data_module_class = GenDataModule
+    else:  # real
+        # 导入真实数据相关模块
+        from scripts.v1.test_onReal import (
+            PL_LightGlue_Real,
+            MultimodalDataModule as RealDataModule,
+            get_default_config
+        )
+        pl_class = PL_LightGlue_Real
+        data_module_class = RealDataModule
+    
+    # 获取配置
+    config = get_default_config()
+    pl.seed_everything(config.TRAINER.SEED)
+    
+    # 确定checkpoint路径
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+    else:
+        ckpt_path = Path(f"results/lightglue_{args.mode}/{args.name}/best_checkpoint/model.ckpt")
+    
+    if not ckpt_path.exists():
+        logger.error(f"检查点不存在: {ckpt_path}")
+        logger.info(f"请确保训练模型存在，或使用 --checkpoint 指定有效的检查点路径")
+        return
+    
+    logger.info(f"加载检查点: {ckpt_path}")
+    
+    # 设置输出目录
+    output_dir = Path(f"results/lightglue_{args.mode}/{args.name}/{args.test_name}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 配置日志
+    log_file = output_dir / "test_log.txt"
+    logger.remove()
+    log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+    logger.add(sys.stderr, format=log_format, level="INFO")
+    logger.add(log_file, format=log_format, level="INFO", mode="w")
+    logger.info(f"日志将保存到: {log_file}")
+    
+    # GPU配置
+    if ',' in str(args.gpus):
+        gpus_list = [int(x) for x in args.gpus.split(',')]
+        _n_gpus = len(gpus_list)
+    else:
+        try:
+            gpus_list = [int(args.gpus)]
+            _n_gpus = 1
+        except:
+            gpus_list = 'auto'
+            _n_gpus = 1
+    
+    config.TRAINER.WORLD_SIZE = max(_n_gpus, 1)
+    config.TRAINER.TRUE_BATCH_SIZE = config.TRAINER.WORLD_SIZE * args.batch_size
+    
+    logger.info(f"测试模式: {args.mode}")
+    logger.info(f"模型名称: {args.name}")
+    logger.info(f"测试名称: {args.test_name}")
+    logger.info(f"输出目录: {output_dir}")
+    logger.info(f"GPU配置: devices={gpus_list}, num_gpus={_n_gpus}")
+    
+    # 从检查点加载模型
+    model = pl_class.load_from_checkpoint(
+        str(ckpt_path),
+        config=config,
+        result_dir=str(output_dir)
+    )
+    model.eval()
+    
+    # 初始化数据模块
+    data_module = data_module_class(args, config)
+    
+    # TensorBoard日志
+    tb_logger = TensorBoardLogger(
+        save_dir='logs/tb_logs', 
+        name=f"lightglue_test_{args.mode}_{args.name}_{args.test_name}"
+    )
+    
+    # Trainer配置
+    trainer_kwargs = {
+        'accelerator': "gpu" if torch.cuda.is_available() else "cpu",
+        'devices': gpus_list,
+        'callbacks': [TestCallback(output_dir)],
+        'logger': tb_logger,
+    }
+    
+    # 多GPU时添加strategy
+    if _n_gpus > 1:
+        from pytorch_lightning.strategies import DDPStrategy
+        trainer_kwargs['strategy'] = DDPStrategy(find_unused_parameters=False)
+    
+    trainer = pl.Trainer(**trainer_kwargs)
+    
+    logger.info(f"开始测试 (模式: {args.mode} | 模型: {args.name})")
+    trainer.test(model, datamodule=data_module)
+    
+    logger.info(f"测试完成! 结果已保存到: {output_dir}")
+
+
+if __name__ == '__main__':
+    main()

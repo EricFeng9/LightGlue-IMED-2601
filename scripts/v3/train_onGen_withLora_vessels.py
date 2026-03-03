@@ -175,13 +175,17 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
         
         # 构建返回结果
         result = {
-            'image0': image0,                  # [1, H, W] CF (固定图)
-            'image1': image1,                  # [1, H, W] FA deformed (未配准的移动图)
+            'image0': image0,                  # [1, H, W] CF (固定图，干净)
+            'image1': image1,                  # [1, H, W] FA deformed (未配准的移动图，干净)
             'image1_gt': data['image0'],       # [1, H, W] 使用原始 CF 作为配准目标
             'T_0to1': data['T_0to1'],          # [3, 3] 变换矩阵
             'pair_names': data['pair_names'],
             'dataset_name': data['dataset_name']
         }
+        
+        # 添加血管掩码（用于课程学习）
+        if 'vessel_mask0' in data:
+            result['vessel_mask0'] = data['vessel_mask0']
         
         return result
 
@@ -304,6 +308,9 @@ class PL_LightGlue_Gen(pl.LightningModule):
         
         # 用于控制是否强制可视化
         self.force_viz = False
+        
+        # 课程学习权重（由 CurriculumScheduler 动态调整）
+        self.vessel_loss_weight = 10.0
         
         # 使用统一的评估器
         self.evaluator = UnifiedEvaluator(mode='gen', config=config)
@@ -434,8 +441,8 @@ class PL_LightGlue_Gen(pl.LightningModule):
         
         return matches_gt
 
-    def _compute_loss(self, outputs, kpts0, kpts1, T_0to1):
-        """计算负对数似然损失"""
+    def _compute_loss(self, outputs, kpts0, kpts1, T_0to1, vessel_mask0=None):
+        """计算加权负对数似然损失（支持血管引导）"""
         scores = outputs['log_assignment']
         matches_gt = self._compute_gt_matches(kpts0, kpts1, T_0to1)
         
@@ -445,23 +452,77 @@ class PL_LightGlue_Gen(pl.LightningModule):
         targets[targets == -1] = N
         
         target_log_probs = torch.gather(scores[:, :M, :], 2, targets.unsqueeze(2)).squeeze(2)
-        loss = -target_log_probs.mean()
+        
+        # 如果提供了血管掩码，进行加权
+        if vessel_mask0 is not None and self.vessel_loss_weight > 1.0:
+            weights = self._compute_vessel_weights(kpts0, vessel_mask0)
+            weighted_log_probs = target_log_probs * weights
+            loss = -weighted_log_probs.mean()
+        else:
+            loss = -target_log_probs.mean()
         
         return loss
+    
+    def _compute_vessel_weights(self, kpts0, vessel_mask0):
+        """计算基于血管掩码的权重"""
+        B, M, _ = kpts0.shape
+        device = kpts0.device
+        weights = torch.ones(B, M, device=device)
+        
+        for b in range(B):
+            # vessel_mask0: [B, 1, H, W] 或 [B, H, W]
+            if vessel_mask0.dim() == 4:
+                mask = vessel_mask0[b, 0]  # [H, W]
+            else:
+                mask = vessel_mask0[b]  # [H, W]
+            
+            H, W = mask.shape
+            kpts = kpts0[b]  # [M, 2]
+            
+            # 将关键点坐标转换为整数索引
+            x_coords = torch.clamp(kpts[:, 0].long(), 0, W - 1)
+            y_coords = torch.clamp(kpts[:, 1].long(), 0, H - 1)
+            
+            # 检查关键点是否在血管上（mask > 0.5 表示血管）
+            is_on_vessel = mask[y_coords, x_coords] > 0.5
+            
+            # 血管上的点赋予高权重，背景点权重为1.0
+            weights[b, is_on_vessel] = self.vessel_loss_weight
+        
+        return weights
 
     def training_step(self, batch, batch_idx):
         """训练步骤（生成数据训练）"""
         outputs = self(batch)
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        
+        # 获取血管掩码（如果存在）
+        vessel_mask0 = batch.get('vessel_mask0', None)
+        
+        loss = self._compute_loss(
+            outputs, 
+            batch['keypoints0'], 
+            batch['keypoints1'], 
+            batch['T_0to1'],
+            vessel_mask0
+        )
         
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train/vessel_weight', self.vessel_loss_weight, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """验证步骤（使用统一的评估器）"""
         outputs = self(batch)
         
-        loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
+        # 计算验证损失
+        vessel_mask0 = batch.get('vessel_mask0', None)
+        loss = self._compute_loss(
+            outputs, 
+            batch['keypoints0'], 
+            batch['keypoints1'], 
+            batch['T_0to1'],
+            vessel_mask0
+        )
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         
         # 使用统一的评估器
@@ -482,7 +543,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
         self.log('auc@5',        metrics['auc@5'],        on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('auc@10',       metrics['auc@10'],       on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('auc@20',       metrics['auc@20'],       on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('mAUC',         metrics.get('mAUC', 0.0), on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('mAUC',         metrics['mAUC'],         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('combined_auc', metrics['combined_auc'], on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
         self.log('val_mse',      metrics['mse'],          on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log('val_mace',     metrics['mace'],         on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
@@ -730,6 +791,47 @@ class MultimodalValidationCallback(Callback):
             pass
 
 # ==========================================
+# 课程学习调度器
+# ==========================================
+class CurriculumScheduler(Callback):
+    """
+    血管引导的课程学习调度器
+    动态调整 vessel_loss_weight 参数
+    
+    Phase 1 (Teaching): Epoch 0-20 -> Weight 10.0 (强迫关注血管)
+    Phase 2 (Weaning):  Epoch 20-50 -> Weight 10.0 -> 1.0 (线性衰减)
+    Phase 3 (Independence): Epoch 50+ -> Weight 1.0 (正常模式)
+    """
+    def __init__(self, teaching_end=20, weaning_end=50, max_weight=10.0, min_weight=1.0):
+        super().__init__()
+        self.teaching_end = teaching_end
+        self.weaning_end = weaning_end
+        self.max_weight = max_weight
+        self.min_weight = min_weight
+    
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        
+        if epoch < self.teaching_end:
+            # 教学期：强迫关注血管
+            current_weight = self.max_weight
+            phase = "Teaching"
+        elif epoch < self.weaning_end:
+            # 断奶期：线性衰减
+            progress = (epoch - self.teaching_end) / (self.weaning_end - self.teaching_end)
+            current_weight = self.max_weight - progress * (self.max_weight - self.min_weight)
+            phase = "Weaning"
+        else:
+            # 独立期：自由探索
+            current_weight = self.min_weight
+            phase = "Independence"
+        
+        # 更新模型权重
+        if hasattr(pl_module, 'vessel_loss_weight'):
+            pl_module.vessel_loss_weight = current_weight
+            logger.info(f"Epoch {epoch} [{phase} Phase]: vessel_loss_weight = {current_weight:.2f}")
+
+# ==========================================
 # 早停机制
 # ==========================================
 class DelayedEarlyStopping(EarlyStopping):
@@ -745,8 +847,8 @@ class DelayedEarlyStopping(EarlyStopping):
 # 参数解析和主函数
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="LightGlue Training on Generated Data with LoRA")
-    parser.add_argument('--name', '-n', type=str, default='260303_gen_baseline', help='训练名称')
+    parser = argparse.ArgumentParser(description="LightGlue Vessel-Guided Training with LoRA")
+    parser.add_argument('--name', '-n', type=str, default='260303_vessel_guided', help='训练名称')
     parser.add_argument('--lora_name', type=str, default=None, help='SuperPoint LoRA训练时保存的name，默认加载该name下的bestcheckpoints')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
@@ -754,6 +856,12 @@ def parse_args():
     parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--max_epochs', type=int, default=200)
     parser.add_argument('--gpus', type=str, default='1')
+    
+    # 课程学习参数
+    parser.add_argument('--teaching_end', type=int, default=50, help='教学期结束 epoch')
+    parser.add_argument('--weaning_end', type=int, default=100, help='断奶期结束 epoch')
+    parser.add_argument('--max_vessel_weight', type=float, default=10.0, help='血管权重最大值')
+    parser.add_argument('--min_vessel_weight', type=float, default=1.0, help='血管权重最小值')
     
     return parser.parse_args()
 
@@ -822,7 +930,22 @@ def main():
         strict=False
     )
     
-    logger.info("早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
+    # 课程学习调度器
+    curriculum_callback = CurriculumScheduler(
+        teaching_end=args.teaching_end,
+        weaning_end=args.weaning_end,
+        max_weight=args.max_vessel_weight,
+        min_weight=args.min_vessel_weight
+    )
+    
+    logger.info("=" * 80)
+    logger.info("【血管引导训练 + SuperPointLoRA】")
+    logger.info("=" * 80)
+    logger.info(f"课程学习配置: Teaching[0-{args.teaching_end}]={args.max_vessel_weight}, "
+                f"Weaning[{args.teaching_end}-{args.weaning_end}]={args.max_vessel_weight}->{args.min_vessel_weight}, "
+                f"Independence[{args.weaning_end}+]={args.min_vessel_weight}")
+    logger.info(f"早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
+    logger.info("=" * 80)
     
     # 确保 args 有 mode 属性（用于回调）
     if not hasattr(args, 'mode'):
@@ -841,6 +964,7 @@ def main():
         'callbacks': [
             MultimodalValidationCallback(args), 
             LearningRateMonitor(logging_interval='step'), 
+            curriculum_callback,
             early_stop_callback
         ],
         'logger': tb_logger,
@@ -856,6 +980,7 @@ def main():
     ckpt_path = args.start_point if args.start_point else None
     
     logger.info(f"开始训练 (训练集: 260227_2_v29_2_1 生成数据 | 验证集: CFFA 真实数据): {args.name}")
+    logger.info("策略: 血管loss引导的课程学习 + SuperPointLoRA")
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
 if __name__ == '__main__':

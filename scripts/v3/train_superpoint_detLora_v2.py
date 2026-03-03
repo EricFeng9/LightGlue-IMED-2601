@@ -506,7 +506,7 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.07)
     parser.add_argument('--safe_radius', type=int, default=8)
     parser.add_argument('--merge_threshold', type=float, default=2.0)
-    parser.add_argument('--max_epochs', type=int, default=100)
+    parser.add_argument('--max_epochs', type=int, default=500)
     parser.add_argument('--gpus', type=str, default='0')
     
     parser.add_argument('--name', type=str, default='superpoint_lora')
