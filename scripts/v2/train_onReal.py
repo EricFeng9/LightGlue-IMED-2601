@@ -32,13 +32,6 @@ from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import
 # 导入统一的测试/验证模块
 from scripts.v2.test import UnifiedEvaluator
 
-# 导入指标计算
-from scripts.v1.metrics import (
-    compute_homography_errors, 
-    aggregate_metrics,
-    set_metrics_verbose
-)
-
 # ==========================================
 # 配置函数
 # ==========================================

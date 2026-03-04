@@ -250,11 +250,71 @@ def spatial_binning(pts0, pts1, img_size, grid_size=4, top_n=20, conf=None):
     return np.array(selected_indices)
 
 
+def compute_corner_error(H_est, H_gt, height, width):
+    """四角点平均重投影误差（MACE）"""
+    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+    corners_h = np.concatenate([corners, np.ones((4, 1), dtype=np.float32)], axis=1)
+
+    try:
+        corners_gt_h = (H_gt @ corners_h.T).T
+        corners_gt = corners_gt_h[:, :2] / (corners_gt_h[:, 2:] + 1e-6)
+        corners_est_h = (H_est @ corners_h.T).T
+        corners_est = corners_est_h[:, :2] / (corners_est_h[:, 2:] + 1e-6)
+        return float(np.mean(np.linalg.norm(corners_est - corners_gt, axis=-1)))
+    except Exception:
+        return float('inf')
+
+
+def _reprojection_stats(H, pts0, pts1):
+    """
+    与 metrics_cau_principle_0304.md 对齐：
+    - MSE: 特征点坐标 MSE = mean((pts1 - pts1_pred)^2)
+    - avg_dist: 匹配点平均重投影误差（L2）
+    """
+    if H is None or len(pts0) == 0:
+        return float('inf'), float('inf'), None
+
+    pts0_homo = pts0.reshape(-1, 1, 2).astype(np.float32)
+    try:
+        pts1_pred = cv2.perspectiveTransform(pts0_homo, H).reshape(-1, 2)
+    except Exception:
+        return float('inf'), float('inf'), None
+
+    diff = (pts1 - pts1_pred).astype(np.float64)
+    mse = float(np.mean(diff ** 2))
+    dis = np.sqrt(diff[:, 0] ** 2 + diff[:, 1] ** 2)
+    avg_dist = float(dis.mean()) if len(dis) > 0 else float('inf')
+    return mse, avg_dist, dis
+
+
 def compute_homography_errors(data, config):
     """
-    计算单应矩阵估计误差 (针对 MultiModal 数据集)
+    严格对齐 scripts/v2/metrics_cau_principle_0304.md 的指标口径：
+    - Failed: num_matches<4 或 inliers_rate<1e-6 或 H≈I (atol=1e-3) 或 H_est None
+    - AUC: 使用 avg_dist（失败样本写入 1e6；成功样本包括 inaccurate 也写入 avg_dist）
+    - Inaccurate: mae>50 或 mee>20（基于 dis = L2(pts1-pts1_pred)）
+    - MSE/MACE: 仅 Acceptable（成功且非 inaccurate），否则置 inf，最终聚合时过滤
+
+    Update:
+        data (dict): 会写入
+            - "H_est": List[np.ndarray] length B
+            - "inliers": List[np.ndarray] length B (bool mask for RANSAC points)
+            - "t_errs": List[float] length B (用于 AUC 的 error = avg_dist 或 1e6)
+            - "mse_list": List[float] length B (Acceptable 才为有限值)
+            - "mace_list": List[float] length B (Acceptable 才为有限值)
+            - "failed_mask": List[bool] length B
+            - "inaccurate_mask": List[bool] length B
     """
-    data.update({'R_errs': [], 't_errs': [], 'inliers': [], 'H_est': []})
+    data.update({
+        'R_errs': [],
+        't_errs': [],
+        'inliers': [],
+        'H_est': [],
+        'mse_list': [],
+        'mace_list': [],
+        'failed_mask': [],
+        'inaccurate_mask': [],
+    })
     
     m_bids = data['m_bids'].cpu().numpy()
     pts0 = data['mkpts0_f'].cpu().numpy()
@@ -270,10 +330,14 @@ def compute_homography_errors(data, config):
         
         if num_matches < 4:
             _dual_log("WARNING", f"⚠️ Batch {bs}: 匹配点数不足 ({num_matches} < 4)")
-            data['R_errs'].append(np.inf)
-            data['t_errs'].append(np.inf)
+            data['R_errs'].append(0.0)
+            data['t_errs'].append(1e6)
             data['inliers'].append(np.array([]).astype(bool))
             data['H_est'].append(np.eye(3))
+            data['mse_list'].append(np.inf)
+            data['mace_list'].append(np.inf)
+            data['failed_mask'].append(True)
+            data['inaccurate_mask'].append(False)
             continue
             
         # 估计单应矩阵 (对应 plan.md 第四阶段: 几何估计)
@@ -287,58 +351,92 @@ def compute_homography_errors(data, config):
         
         _dual_log("INFO", f"🔍 Batch {bs}: 总匹配点={num_matches}, Spatial Binning后={len(bin_indices)}")
         
+        ransac_thr = float(getattr(getattr(config, 'TRAINER', object()), 'RANSAC_PIXEL_THR', 3.0))
         if len(bin_indices) >= 4:
             pts0_ransac = pts0_batch[bin_indices]
             pts1_ransac = pts1_batch[bin_indices]
-            H_est, inliers = cv2.findHomography(pts0_ransac, pts1_ransac, cv2.RANSAC, config.TRAINER.RANSAC_PIXEL_THR)
+            H_est, inliers = cv2.findHomography(pts0_ransac, pts1_ransac, cv2.RANSAC, ransac_thr)
+            denom_inliers = len(pts0_ransac)
         else:
-            H_est, inliers = cv2.findHomography(pts0_batch, pts1_batch, cv2.RANSAC, config.TRAINER.RANSAC_PIXEL_THR)
+            H_est, inliers = cv2.findHomography(pts0_batch, pts1_batch, cv2.RANSAC, ransac_thr)
+            denom_inliers = len(pts0_batch)
         
-        if H_est is None:
-            # 【调试】RANSAC 失败，记录原因
-            _dual_log("WARNING", f"⚠️ Batch {bs}: RANSAC 返回 None (匹配点数: {len(bin_indices) if len(bin_indices) >= 4 else num_matches})")
-            data['R_errs'].append(np.inf)
-            data['t_errs'].append(np.inf)
+        # --- Failed 判定（严格对齐 0304 原则）---
+        is_failed = False
+        if H_est is None or (isinstance(H_est, np.ndarray) and (np.isnan(H_est).any() or np.isinf(H_est).any())):
+            is_failed = True
+        else:
+            inliers_arr = inliers.ravel() > 0 if inliers is not None else np.array([], dtype=bool)
+            num_inliers = int(np.sum(inliers_arr)) if inliers_arr.size > 0 else 0
+            inliers_rate = num_inliers / max(1, int(denom_inliers))
+            is_identity = np.allclose(H_est, np.eye(3), atol=1e-3)
+
+            _dual_log(
+                "INFO",
+                f"✅ Batch {bs}: RANSAC 成功, inliers={num_inliers}/{denom_inliers}, "
+                f"inliers_rate={inliers_rate:.2e}, H_est是否单位矩阵={is_identity}"
+            )
+
+            if inliers_rate < 1e-6:
+                _dual_log("WARNING", f"⚠️ Batch {bs}: inliers_rate < 1e-6，视为失败")
+                is_failed = True
+            if is_identity:
+                _dual_log("WARNING", f"⚠️ Batch {bs}: H_est 接近单位矩阵 (atol=1e-3)，视为失败")
+                is_failed = True
+
+        if is_failed:
+            _dual_log("WARNING", f"⚠️ Batch {bs}: 匹配失败 (Failed)")
+            data['R_errs'].append(0.0)
+            data['t_errs'].append(1e6)
             data['inliers'].append(np.array([]).astype(bool))
             data['H_est'].append(np.eye(3))
-        else:
-            # 【调试】检查 inliers 数量和矩阵状态
-            num_inliers = np.sum(inliers.ravel() > 0) if inliers is not None else 0
-            is_identity = np.allclose(H_est, np.eye(3), atol=1e-3)
-            
-            _dual_log("INFO", f"✅ Batch {bs}: RANSAC 成功, inliers={num_inliers}/{len(bin_indices) if len(bin_indices) >= 4 else num_matches}, H_est是否单位矩阵={is_identity}")
-            
-            if is_identity:
-                _dual_log("WARNING", f"⚠️ Batch {bs}: H_est 接近单位矩阵! 这不正常!")
-                _dual_log("WARNING", f"   pts0 范围: [{pts0_batch[:, 0].min():.1f}, {pts0_batch[:, 0].max():.1f}] x [{pts0_batch[:, 1].min():.1f}, {pts0_batch[:, 1].max():.1f}]")
-                _dual_log("WARNING", f"   pts1 范围: [{pts1_batch[:, 0].min():.1f}, {pts1_batch[:, 0].max():.1f}] x [{pts1_batch[:, 1].min():.1f}, {pts1_batch[:, 1].max():.1f}]")
-            elif num_inliers < 30:
-                _dual_log("WARNING", f"⚠️ Batch {bs}: Inliers 数量较少 ({num_inliers}), 可能导致配准质量差")
-            
-            # 对于眼底图像配准，我们将 R_errs 设为 0
-            # 将 t_errs 设为 Corner Error，用于 AUC 计算 (对应 MegaDepth/LoFTR 的标准评测方式)
+            data['mse_list'].append(np.inf)
+            data['mace_list'].append(np.inf)
+            data['failed_mask'].append(True)
+            data['inaccurate_mask'].append(False)
+            continue
+
+        # --- 成功样本：计算 avg_dist / MSE / Inaccurate / MACE ---
+        mse, avg_dist, dis = _reprojection_stats(H_est, pts0_batch, pts1_batch)
+        if dis is None or not np.isfinite(avg_dist):
+            # 极端数值问题，按失败处理
+            _dual_log("WARNING", f"⚠️ Batch {bs}: 重投影误差异常，按失败处理")
             data['R_errs'].append(0.0)
-            
-            # 重要修复：计算 Corner Error (估计 H 与 真值 H 之间的偏差)
-            # 而不是计算 H_est 在其自身内点上的残差
-            h, w = data['image0'].shape[2:]
-            corners = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype=np.float32)
-            corners_h = np.concatenate([corners, np.ones((4, 1))], axis=-1)
-            
-            # 使用真值 H 投影得到 GT 坐标
-            corners_gt_h = (H_gt[bs] @ corners_h.T).T
-            corners_gt = corners_gt_h[:, :2] / (corners_gt_h[:, 2:] + 1e-7)
-            
-            # 使用估计 H 投影得到预测坐标
-            corners_est_h = (H_est @ corners_h.T).T
-            corners_est = corners_est_h[:, :2] / (corners_est_h[:, 2:] + 1e-7)
-            
-            # 计算平均角点误差
-            err = np.mean(np.linalg.norm(corners_est - corners_gt, axis=-1))
-            
-            data['t_errs'].append(err)
-            data['inliers'].append(inliers.ravel() > 0)
-            data['H_est'].append(H_est)
+            data['t_errs'].append(1e6)
+            data['inliers'].append(np.array([]).astype(bool))
+            data['H_est'].append(np.eye(3))
+            data['mse_list'].append(np.inf)
+            data['mace_list'].append(np.inf)
+            data['failed_mask'].append(True)
+            data['inaccurate_mask'].append(False)
+            continue
+
+        mae = float(np.max(dis)) if len(dis) > 0 else float('inf')
+        mee = float(np.median(dis)) if len(dis) > 0 else float('inf')
+        is_inaccurate = (mae > 50.0) or (mee > 20.0)
+
+        if is_inaccurate:
+            _dual_log("WARNING", f"⚠️ Batch {bs}: Inaccurate (mae={mae:.2f}, mee={mee:.2f})")
+
+        h, w = data['image0'].shape[2:]
+        mace = compute_corner_error(H_est, H_gt[bs], height=h, width=w)
+
+        # AUC: 成功样本（含 inaccurate）使用 avg_dist
+        data['R_errs'].append(0.0)
+        data['t_errs'].append(avg_dist)
+        data['inliers'].append(inliers.ravel() > 0 if inliers is not None else np.array([]).astype(bool))
+        data['H_est'].append(H_est)
+
+        # MSE/MACE: 仅 Acceptable 样本统计，否则置 inf
+        if is_inaccurate:
+            data['mse_list'].append(np.inf)
+            data['mace_list'].append(np.inf)
+        else:
+            data['mse_list'].append(mse)
+            data['mace_list'].append(mace)
+
+        data['failed_mask'].append(False)
+        data['inaccurate_mask'].append(bool(is_inaccurate))
 
 
 # --- METRIC AGGREGATION ---

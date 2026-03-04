@@ -268,7 +268,7 @@ class MultimodalDataModule(pl.LightningDataModule):
             
             # 验证集：operation_pre_filtered_cffa 测试集
             val_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='fa2cf')
+            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='cf2fa')
             self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
             logger.info(f"验证集加载 operation_pre_filtered_cffa 测试集: {len(self.val_dataset)} 样本")
 

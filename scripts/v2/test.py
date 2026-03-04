@@ -17,7 +17,7 @@ import pytorch_lightning as pl
 # 添加父目录到 sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from scripts.v1.metrics import (
+from scripts.v2.metrics import (
     compute_homography_errors, 
     set_metrics_verbose,
     error_auc,
@@ -40,48 +40,6 @@ def is_valid_homography(H, scale_min=0.1, scale_max=10.0, perspective_threshold=
         return False
     
     return True
-
-
-def filter_valid_area(img1, img2):
-    """筛选有效区域：只保留两张图片都不为纯黑像素的部分"""
-    assert img1.shape[:2] == img2.shape[:2], "两张图片的尺寸必须一致"
-    if len(img1.shape) == 3:
-        mask1 = np.any(img1 > 10, axis=2)
-    else:
-        mask1 = img1 > 0
-    if len(img2.shape) == 3:
-        mask2 = np.any(img2 > 10, axis=2)
-    else:
-        mask2 = img2 > 0
-    valid_mask = mask1 & mask2
-    rows = np.any(valid_mask, axis=1)
-    cols = np.any(valid_mask, axis=0)
-    if not np.any(rows) or not np.any(cols):
-        return img1, img2
-    row_min, row_max = np.where(rows)[0][[0, -1]]
-    col_min, col_max = np.where(cols)[0][[0, -1]]
-    filtered_img1 = img1[row_min:row_max+1, col_min:col_max+1].copy()
-    filtered_img2 = img2[row_min:row_max+1, col_min:col_max+1].copy()
-    valid_mask_cropped = valid_mask[row_min:row_max+1, col_min:col_max+1]
-    filtered_img1[~valid_mask_cropped] = 0
-    filtered_img2[~valid_mask_cropped] = 0
-    return filtered_img1, filtered_img2
-
-
-def compute_corner_error(H_est, H_gt, height, width):
-    """计算四个角点的平均重投影误差（MACE）"""
-    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
-    corners_homo = np.concatenate([corners, np.ones((4, 1), dtype=np.float32)], axis=1)
-    corners_gt_homo = (H_gt @ corners_homo.T).T
-    corners_gt = corners_gt_homo[:, :2] / (corners_gt_homo[:, 2:] + 1e-6)
-    corners_est_homo = (H_est @ corners_homo.T).T
-    corners_est = corners_est_homo[:, :2] / (corners_est_homo[:, 2:] + 1e-6)
-    try:
-        errors = np.sqrt(np.sum((corners_est - corners_gt)**2, axis=1))
-        mace = np.mean(errors)
-    except:
-        mace = float('inf')
-    return mace
 
 
 class UnifiedEvaluator:
@@ -107,6 +65,8 @@ class UnifiedEvaluator:
         self.all_maces = []   # 累积所有样本的 MACE
         self.total_samples = 0
         self.failed_samples = 0
+        self.inaccurate_samples = 0
+        self.acceptable_samples = 0
     
     def evaluate_batch(self, batch, outputs, pl_module):
         """
@@ -123,21 +83,15 @@ class UnifiedEvaluator:
         matches0 = outputs['matches0']
         kpts0 = batch['keypoints0']
         kpts1 = batch['keypoints1']
-        
+
         B = kpts0.shape[0]
-        H_ests = []
-        batch_mses = []
-        batch_maces = []
-        
-        # 构建用于 metrics.py 的数据格式
+
+        # 构建用于 scripts/v2/metrics.py 的数据格式（跨 batch 拼接匹配点）
         mkpts0_f_list = []
         mkpts1_f_list = []
         m_bids_list = []
         
-        # 为每张图计算单应矩阵
         for b in range(B):
-            self.total_samples += 1
-            
             m0 = matches0[b]
             valid = m0 > -1
             m_indices_0 = torch.where(valid)[0]
@@ -151,63 +105,6 @@ class UnifiedEvaluator:
                 mkpts0_f_list.append(torch.from_numpy(pts0).float())
                 mkpts1_f_list.append(torch.from_numpy(pts1).float())
                 m_bids_list.append(torch.full((len(pts0),), b, dtype=torch.long))
-            
-            # 计算单应矩阵
-            if len(pts0) >= 4:
-                try:
-                    ransac_thr = self.config.TRAINER.RANSAC_PIXEL_THR if self.config else 3.0
-                    H, _ = cv2.findHomography(pts0, pts1, cv2.RANSAC, ransac_thr)
-                    if H is None:
-                        H = np.eye(3)
-                except:
-                    H = np.eye(3)
-            else:
-                H = np.eye(3)
-            
-            # 判断是否匹配失败
-            is_match_failed = False
-            if not is_valid_homography(H):
-                H = np.eye(3)
-                is_match_failed = True
-            elif np.allclose(H, np.eye(3), atol=1e-3):
-                is_match_failed = True
-            elif len(pts0) < 4:
-                is_match_failed = True
-            
-            if is_match_failed:
-                self.failed_samples += 1
-            
-            H_ests.append(H)
-            
-            # 计算 MSE 和 MACE（只在匹配成功时）
-            if not is_match_failed:
-                img0 = (batch['image0'][b, 0].cpu().numpy() * 255).astype(np.uint8)
-                img1 = (batch['image1'][b, 0].cpu().numpy() * 255).astype(np.uint8)
-                img1_gt = (batch['image1_gt'][b, 0].cpu().numpy() * 255).astype(np.uint8)
-                
-                h, w = img0.shape
-                try:
-                    H_inv = np.linalg.inv(H)
-                    img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
-                except:
-                    img1_result = img1.copy()
-                
-                # 计算 MSE
-                try:
-                    res_f, orig_f = filter_valid_area(img1_result, img1_gt)
-                    mask = (res_f > 0)
-                    mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
-                except:
-                    mse = 0.0
-                
-                # 计算 MACE
-                T_gt = batch['T_0to1'][b].cpu().numpy()
-                mace = compute_corner_error(H, T_gt, h, w)
-                
-                batch_mses.append(mse)
-                batch_maces.append(mace)
-                self.all_mses.append(mse)
-                self.all_maces.append(mace)
         
         # 构建 metrics.py 需要的 batch 格式
         metrics_batch = {
@@ -219,16 +116,40 @@ class UnifiedEvaluator:
             'dataset_name': batch['dataset_name']
         }
         
-        # 使用 metrics.py 计算指标（会填充 t_errs）
-        set_metrics_verbose(False)  # 训练时不输出详细日志
+        # 训练时关闭详细日志；测试阶段由外部显式开启
+        split = batch.get('split', None)
+        if split is not None:
+            split0 = split[0] if isinstance(split, (list, tuple)) else split
+            if split0 == 'train':
+                set_metrics_verbose(False)
+
+        # 使用 metrics.py 计算指标（会填充 t_errs / mse_list / mace_list 等）
         compute_homography_errors(metrics_batch, self.config if self.config else pl_module.config)
-        
-        # 累积误差用于后续统一计算 AUC
+
+        # --- 累积 epoch 级统计（严格对齐 metrics_cau_principle_0304.md）---
+        self.total_samples += B
+        failed_mask = metrics_batch.get('failed_mask', [False] * B)
+        inaccurate_mask = metrics_batch.get('inaccurate_mask', [False] * B)
+
+        self.failed_samples += int(np.sum(np.array(failed_mask, dtype=np.int64)))
+        self.inaccurate_samples += int(np.sum(np.array(inaccurate_mask, dtype=np.int64)))
+        self.acceptable_samples += int(B - np.sum(np.array(failed_mask, dtype=np.int64)) - np.sum(np.array(inaccurate_mask, dtype=np.int64)))
+
         if len(metrics_batch.get('t_errs', [])) > 0:
-            self.all_errors.extend(metrics_batch['t_errs'])
+            self.all_errors.extend(list(metrics_batch['t_errs']))
+
+        # MSE/MACE：仅 Acceptable（metrics.py 已对 failed/inaccurate 置 inf，这里过滤掉）
+        batch_mses = list(metrics_batch.get('mse_list', []))
+        batch_maces = list(metrics_batch.get('mace_list', []))
+        for mse in batch_mses:
+            if np.isfinite(mse):
+                self.all_mses.append(float(mse))
+        for mace in batch_maces:
+            if np.isfinite(mace):
+                self.all_maces.append(float(mace))
         
         return {
-            'H_est': H_ests,
+            'H_est': metrics_batch.get('H_est', [np.eye(3)] * B),
             'mses': batch_mses,
             'maces': batch_maces,
             'metrics_batch': metrics_batch,
@@ -273,6 +194,11 @@ class UnifiedEvaluator:
         metrics['total_samples'] = self.total_samples
         metrics['failed_samples'] = self.failed_samples
         metrics['success_samples'] = self.total_samples - self.failed_samples
+
+        metrics['inaccurate_samples'] = self.inaccurate_samples
+        metrics['acceptable_samples'] = self.acceptable_samples
+        metrics['inaccurate_rate'] = self.inaccurate_samples / self.total_samples if self.total_samples > 0 else 0.0
+        metrics['acceptable_rate'] = self.acceptable_samples / self.total_samples if self.total_samples > 0 else 0.0
         
         return metrics
 
@@ -578,8 +504,10 @@ def main():
         f.write(f"匹配成功样本数: {metrics['success_samples']}\n")
         f.write(f"匹配失败样本数: {metrics['failed_samples']}\n")
         f.write(f"匹配失败率: {metrics['match_failure_rate']:.4f}\n")
-        f.write(f"MSE (仅匹配成功): {metrics['mse']:.6f}\n")
-        f.write(f"MACE (仅匹配成功): {metrics['mace']:.4f}\n")
+        f.write(f"Inaccurate 样本数: {metrics['inaccurate_samples']}\n")
+        f.write(f"Acceptable 样本数: {metrics['acceptable_samples']}\n")
+        f.write(f"MSE (仅 Acceptable): {metrics['mse']:.6f}\n")
+        f.write(f"MACE (仅 Acceptable): {metrics['mace']:.4f}\n")
         f.write(f"AUC@5: {metrics['auc@5']:.4f}\n")
         f.write(f"AUC@10: {metrics['auc@10']:.4f}\n")
         f.write(f"AUC@20: {metrics['auc@20']:.4f}\n")
