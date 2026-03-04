@@ -99,10 +99,10 @@ class MultiModalDataset(Dataset):
         img_h, img_w = self.img_size, self.img_size
         
         # 1. 基础仿射变换参数（扩大范围以匹配真实数据）
-        angle = rng.uniform(-35, 35)      # 旋转：±35°
+        angle = rng.uniform(-45, 45)      # 旋转：±45°
         scale = rng.uniform(0.85, 1.15)  # 缩放：0.85-1.15
-        tx = rng.uniform(-0.08, 0.08) * img_w   # 平移：±8%
-        ty = rng.uniform(-0.08, 0.08) * img_h
+        tx = rng.uniform(-0.15, 0.15) * img_w   # 平移：±15%
+        ty = rng.uniform(-0.15, 0.15) * img_h
         
         center = (img_w // 2, img_h // 2)
         M = cv2.getRotationMatrix2D(center, angle, scale)
