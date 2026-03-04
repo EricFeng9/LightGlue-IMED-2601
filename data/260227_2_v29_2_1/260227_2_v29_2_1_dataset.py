@@ -84,21 +84,42 @@ class MultiModalDataset(Dataset):
         return find(f_names), find(m_names), find(seg_names)
 
     def _get_random_affine(self, rng=None):
+        """
+        生成随机仿射变换参数（与真实数据变换范围对齐）
+        真实数据使用 cv2.findHomography 估计单应矩阵，
+        但在实际应用中，许多医学图像配准场景的透视畸变较小，
+        仿射变换已经能够很好地近似。
+        
+        关键改进：
+        - 扩大参数范围以更好地匹配真实数据分布
+        - 添加轻微的透视畸变模拟（通过在角落添加微小扰动）
+        """
         if rng is None: rng = np.random
         
-        angle = rng.uniform(-30, 30)
-        scale = rng.uniform(0.9, 1.1)
-        tx = rng.uniform(-0.05, 0.05) * self.img_size
-        ty = rng.uniform(-0.05, 0.05) * self.img_size
+        img_h, img_w = self.img_size, self.img_size
         
-        center = (self.img_size // 2, self.img_size // 2)
+        # 1. 基础仿射变换参数（扩大范围以匹配真实数据）
+        angle = rng.uniform(-35, 35)      # 旋转：±35°
+        scale = rng.uniform(0.85, 1.15)  # 缩放：0.85-1.15
+        tx = rng.uniform(-0.08, 0.08) * img_w   # 平移：±8%
+        ty = rng.uniform(-0.08, 0.08) * img_h
+        
+        center = (img_w // 2, img_h // 2)
         M = cv2.getRotationMatrix2D(center, angle, scale)
         M[0, 2] += tx
         M[1, 2] += ty
         
-        # 扩展为 3x3
+        # 2. 扩展为 3x3 矩阵
         H = np.eye(3, dtype=np.float32)
         H[:2, :] = M
+        
+        # 3. 添加微小的透视扰动（模拟真实世界中的轻微透视畸变）
+        # 真实单应矩阵的 h20, h21 通常很小
+        # 这里使用很小的值：±0.0005（比之前的 ±0.003 小6倍）
+        perspective_strength = 0.0005
+        H[2, 0] = rng.uniform(-perspective_strength, perspective_strength)
+        H[2, 1] = rng.uniform(-perspective_strength, perspective_strength)
+        
         return H
 
     def __len__(self):
@@ -125,17 +146,17 @@ class MultiModalDataset(Dataset):
         if seg_img.shape[:2] != (self.img_size, self.img_size):
             seg_img = cv2.resize(seg_img, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
         
-        # 3. 生成仿射变换 (T)
+        # 3. 生成随机变换
         if self.split == 'train':
-            H_forward = self._get_random_affine() # 随机
+            H_forward = self._get_random_affine()  # 随机
         else:
             # 验证集使用固定变换，便于对比
             rng = np.random.RandomState(idx)
             H_forward = self._get_random_affine(rng)
             
-        # 4. 应用变换 (Warp) - 对 fa 和 seg 同时变换
-        fa_deformed = cv2.warpAffine(fa_img, H_forward[:2], (self.img_size, self.img_size), flags=cv2.INTER_LINEAR)
-        seg_deformed = cv2.warpAffine(seg_img, H_forward[:2], (self.img_size, self.img_size), flags=cv2.INTER_NEAREST)
+        # 4. 应用透视变换 (Warp) - 支持透视矩阵
+        fa_deformed = cv2.warpPerspective(fa_img, H_forward, (self.img_size, self.img_size), flags=cv2.INTER_LINEAR)
+        seg_deformed = cv2.warpPerspective(seg_img, H_forward, (self.img_size, self.img_size), flags=cv2.INTER_NEAREST)
         
         # 5. 归一化 [0, 1] 并转 Tensor
         cf_norm = cf_img.astype(np.float32) / 255.0
