@@ -397,26 +397,20 @@ def main():
     """主函数"""
     args = parse_args()
     
-    # 导入必要的模块（根据mode动态导入）
+    # 导入必要的模块（统一使用 CFFA 数据集）
     if args.mode == 'gen':
-        # 导入生成数据相关模块
         from scripts.v2.train_onGen_vessels import (
             PL_LightGlue_Gen, 
-            MultimodalDataModule as GenDataModule,
             get_default_config
         )
         pl_class = PL_LightGlue_Gen
-        data_module_class = GenDataModule
         mode_dir = 'lightglue_gen'
     else:  # cffa
-        # 导入真实数据相关模块
         from scripts.v2.train_onReal import (
             PL_LightGlue_Real,
-            MultimodalDataModule as RealDataModule,
             get_default_config
         )
         pl_class = PL_LightGlue_Real
-        data_module_class = RealDataModule
         mode_dir = 'lightglue_cffa'
     
     # 获取配置
@@ -477,10 +471,35 @@ def main():
     )
     model.eval()
     
-    # 初始化数据模块
-    data_module = data_module_class(args, config)
-    data_module.setup('fit')  # 使用 'fit' 来加载验证集
-    test_dataloader = data_module.val_dataloader()  # 使用验证集作为测试集
+    # 统一使用 CFFA 完整数据集（训练集+验证集合并）进行测试
+    script_dir = Path(__file__).parent.parent.parent
+    cffa_data_dir = script_dir / 'data' / 'CFFA'
+    
+    # 导入 CFFA 数据集相关模块
+    from data.CFFA.cffa_dataset import CFFADataset
+    from scripts.v2.train_onReal import RealDatasetWrapper
+    
+    # 加载训练集
+    train_base = CFFADataset(root_dir=str(cffa_data_dir), split='train', mode='cf2fa')
+    train_dataset = RealDatasetWrapper(train_base, split_name='test')
+    
+    # 加载验证集（相当于测试集）
+    val_base = CFFADataset(root_dir=str(cffa_data_dir), split='val', mode='cf2fa')
+    val_dataset = RealDatasetWrapper(val_base, split_name='test')
+    
+    # 合并训练集和验证集作为完整测试集
+    from torch.utils.data import ConcatDataset
+    combined_dataset = ConcatDataset([train_dataset, val_dataset])
+    
+    test_dataloader = torch.utils.data.DataLoader(
+        combined_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    
+    logger.info(f"CFFA完整数据集: 训练集 {len(train_dataset)} + 验证集 {len(val_dataset)} = {len(combined_dataset)} 样本")
     
     logger.info(f"开始测试 (模式: {args.mode} | 模型: {args.name})")
     

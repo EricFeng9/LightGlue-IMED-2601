@@ -289,9 +289,9 @@ def _reprojection_stats(H, pts0, pts1):
 
 def compute_homography_errors(data, config):
     """
-    严格对齐 scripts/v2/metrics_cau_principle_0304.md 的指标口径：
+    严格对齐 scripts/v2/metrics_cau_principle_0305.md 的指标口径：
     - Failed: num_matches<4 或 inliers_rate<1e-6 或 H≈I (atol=1e-3) 或 H_est None
-    - AUC: 使用 avg_dist（失败样本写入 1e6；成功样本包括 inaccurate 也写入 avg_dist）
+    - AUC: 使用 mace（角点误差，失败样本写入 1e6；成功样本包括 inaccurate 也写入 mace）
     - Inaccurate: mae>50 或 mee>20（基于 dis = L2(pts1-pts1_pred)）
     - MSE/MACE: 仅 Acceptable（成功且非 inaccurate），否则置 inf，最终聚合时过滤
 
@@ -299,7 +299,7 @@ def compute_homography_errors(data, config):
         data (dict): 会写入
             - "H_est": List[np.ndarray] length B
             - "inliers": List[np.ndarray] length B (bool mask for RANSAC points)
-            - "t_errs": List[float] length B (用于 AUC 的 error = avg_dist 或 1e6)
+            - "t_errs": List[float] length B (用于 AUC 的 error = mace 或 1e6)
             - "mse_list": List[float] length B (Acceptable 才为有限值)
             - "mace_list": List[float] length B (Acceptable 才为有限值)
             - "failed_mask": List[bool] length B
@@ -421,9 +421,14 @@ def compute_homography_errors(data, config):
         h, w = data['image0'].shape[2:]
         mace = compute_corner_error(H_est, H_gt[bs], height=h, width=w)
 
-        # AUC: 成功样本（含 inaccurate）使用 avg_dist
+        # 处理极端 mace 值（数值问题时用大值替代）
+        if not np.isfinite(mace):
+            _dual_log("WARNING", f"⚠️ Batch {bs}: mace 数值异常 ({mace})，用 1e6 替代")
+            mace = 1e6
+
+        # AUC: 成功样本（含 inaccurate）使用 mace（角点误差，避免自拟合欺骗）
         data['R_errs'].append(0.0)
-        data['t_errs'].append(avg_dist)
+        data['t_errs'].append(mace)
         data['inliers'].append(inliers.ravel() > 0 if inliers is not None else np.array([]).astype(bool))
         data['H_est'].append(H_est)
 
