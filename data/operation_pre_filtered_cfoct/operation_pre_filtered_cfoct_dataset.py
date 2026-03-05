@@ -146,17 +146,38 @@ class CFOCTDataset(Dataset):
                         'oct_pts': oct_pts
                     })
         
-        # 2. 8:2 随机划分 (固定种子以保证可复现)
-        random.Random(42).shuffle(all_samples)
-        num_total = len(all_samples)
-        num_train = int(num_total * 0.8)
-        
+        # 2. 按眼球编号分组，然后按组划分训练集和测试集
+        # 提取眼球编号（子目录名中下划线前的部分，如 003_01 -> 003）
+        eye_groups = {}
+        for sample in all_samples:
+            # 从路径中提取眼球编号
+            subdir_name = os.path.basename(os.path.dirname(sample['cf_path']))
+            eye_id = subdir_name.split('_')[0]  # 例如 "003_01" -> "003"
+
+            if eye_id not in eye_groups:
+                eye_groups[eye_id] = []
+            eye_groups[eye_id].append(sample)
+
+        # 按眼球ID排序并随机划分（固定种子以保证可复现）
+        eye_ids = sorted(eye_groups.keys())
+        random.Random(42).shuffle(eye_ids)
+
+        num_total_eyes = len(eye_ids)
+        num_train_eyes = int(num_total_eyes * 0.8)
+
+        train_eye_ids = set(eye_ids[:num_train_eyes])
+        test_eye_ids = set(eye_ids[num_train_eyes:])
+
+        # 根据眼球ID分配样本
         if split == 'train':
-            self.samples = all_samples[:num_train]
-        else: # val or test
-            self.samples = all_samples[num_train:]
-        
-        print(f"[CFOCTDataset] {split} set: {len(self.samples)} samples (total {num_total})")
+            for eye_id in train_eye_ids:
+                self.samples.extend(eye_groups[eye_id])
+        else:  # val or test
+            for eye_id in test_eye_ids:
+                self.samples.extend(eye_groups[eye_id])
+
+        num_total = len(all_samples)
+        print(f"[CFOCTDataset] {split} set: {len(self.samples)} samples from {len(eye_ids) - num_train_eyes if split != 'train' else num_train_eyes} eye images (total {num_total} samples, {num_total_eyes} eye images)")
 
     def __len__(self):
         return len(self.samples)
@@ -207,16 +228,25 @@ class CFOCTDataset(Dataset):
         # 6. 准备原始moving
         moving_original_pil = Image.fromarray(moving_np).resize((SIZE, SIZE), Image.BICUBIC)
         
-        # 7. Resize 并补偿尺度
+        # 7. Resize 到 512x512 并补偿 T_0to1 尺度
         h_orig, w_orig = fix_filtered.shape[:2]
-        sx = SIZE / float(w_orig)
-        sy = SIZE / float(h_orig)
-        T_scale = np.array([
-            [sx, 0, 0],
-            [0, sy, 0],
+        h_mov_orig, w_mov_orig = moving_np.shape[:2]
+        
+        # 尺度补偿：T_scaled = T_fix_scale @ T_orig @ inv(T_mov_scale)
+        # 这样矩阵才能在 512x512 空间内自恰
+        T_fix_scale = np.array([
+            [SIZE / float(w_orig), 0, 0],
+            [0, SIZE / float(h_orig), 0],
             [0, 0, 1]
         ], dtype=np.float32)
-        T_0to1 = T_scale @ T_0to1
+        
+        T_mov_scale_inv = np.array([
+            [float(w_mov_orig) / SIZE, 0, 0],
+            [0, float(h_mov_orig) / SIZE, 0],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        T_0to1 = T_fix_scale @ T_0to1 @ T_mov_scale_inv
 
         fix_pil = Image.fromarray(fix_filtered).resize((SIZE, SIZE), Image.BICUBIC)
         moving_gt_pil = Image.fromarray(moving_gt_filtered).resize((SIZE, SIZE), Image.BICUBIC)

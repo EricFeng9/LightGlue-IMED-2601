@@ -16,6 +16,7 @@ from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
+from torch.utils.data import ConcatDataset
 import logging
 from types import SimpleNamespace
 
@@ -26,12 +27,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from lightglue import LightGlue, SuperPoint
 from lightglue import viz2d
 
-# 导入生成数据集
+# 导入生成数据集 (260305_1_v30)
 # 注意：由于文件夹名包含点号，需要使用 importlib 动态导入
 import importlib.util
 spec = importlib.util.spec_from_file_location(
-    "multimodal_dataset_v29_2_1", 
-    os.path.join(os.path.dirname(__file__), '../../data/260227_2_v29_2_1/260227_2_v29_2_1_dataset.py')
+    "multimodal_dataset_260305_1_v30", 
+    os.path.join(os.path.dirname(__file__), '../../data/260305_1_v30/260305_1_v30.py')
 )
 multimodal_dataset_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(multimodal_dataset_module)
@@ -39,6 +40,8 @@ MultiModalDataset = multimodal_dataset_module.MultiModalDataset
 
 # 导入真实数据集（用于验证）
 from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
+from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
+from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
 # 导入统一的测试/验证模块
 from scripts.v2.test import UnifiedEvaluator
@@ -58,6 +61,7 @@ def get_default_config():
     conf.TRAINER.WORLD_SIZE = 1
     conf.TRAINER.TRUE_BATCH_SIZE = 4
     conf.TRAINER.PLOT_MODE = 'evaluation'
+    conf.TRAINER.PATIENCE = 10  # 默认 patience 值
     
     conf.MATCHING = {
         'features': 'superpoint',
@@ -145,65 +149,77 @@ def create_chessboard(img1, img2, grid_size=4):
                 chessboard[y_start:y_end, x_start:x_end] = img2[y_start:y_end, x_start:x_end]
     return chessboard
 
+# 导入域随机化增强模块
+from scripts.v2_multi.gen_data_enhance import random_domain_augment_image
+
 # ==========================================
-# 辅助类: GenDatasetWrapper (格式转换，适配 260227_2_v29_2_1 数据集)
+# 辅助类: GenDatasetWrapper (格式转换，适配 260305_1_v30 数据集)
 # ==========================================
 class GenDatasetWrapper(torch.utils.data.Dataset):
-    def __init__(self, base_dataset):
+    def __init__(self, base_dataset, apply_domain_aug=True):
         self.base_dataset = base_dataset
-        
+        self.apply_domain_aug = apply_domain_aug  # 是否应用域随机化增强
+
     def __len__(self):
         return len(self.base_dataset)
-    
+
     def __getitem__(self, idx):
         # 新数据集返回字典格式，包含：
-        # 'image0': CF (固定图) [1, H, W]
-        # 'image1': FA deformed (变形后的移动图) [1, H, W]
+        # 'image0': fix (固定图) [1, H, W]
+        # 'image1': moving deformed (变形后的移动图) [1, H, W]
+        # 'image1_gt': moving original (原始未形变的移动图) [1, H, W]
         # 'T_0to1': 从 image0 到 image1 的变换 [3, 3]
         # 'pair_names': (fix_name, moving_name)
         # 'dataset_name': 'multimodal'
         # 'seg_original', 'seg_deformed', 'vessel_mask0', 'vessel_mask1'
-        
+
         data = self.base_dataset[idx]
-        
-        # 获取图像
-        image0 = data['image0']  # [1, H, W] CF (固定图)
-        image1 = data['image1']  # [1, H, W] FA deformed (未配准的移动图)
-        
+
+        # 获取原始图像
+        image0 = data['image0']  # [1, H, W]
+        image1 = data['image1']  # [1, H, W]
+        image1_gt = data['image1_gt']  # [1, H, W] - 不应用增强，用于评估
+
+        # 应用域随机化增强 (只对训练图像应用，不对 GT 图像应用)
+        if self.apply_domain_aug:
+            # 将 tensor 转为 numpy 进行增强处理
+            # image0: [1, H, W] -> [H, W]
+            img0_np = image0.squeeze(0).cpu().numpy()
+            img1_np = image1.squeeze(0).cpu().numpy()
+
+            # 应用域随机化增强
+            img0_aug = random_domain_augment_image(img0_np)
+            img1_aug = random_domain_augment_image(img1_np)
+
+            # 转换回 tensor
+            image0 = torch.from_numpy(img0_aug).unsqueeze(0).float()
+            image1 = torch.from_numpy(img1_aug).unsqueeze(0).float()
+
         # 构建返回结果
         result = {
-            'image0': image0,                  # [1, H, W] CF (固定图，干净)
-            'image1': image1,                  # [1, H, W] FA deformed (未配准的移动图，干净)
-            'image1_gt': data['image0'],       # [1, H, W] 使用原始 CF 作为配准目标
-            'T_0to1': data['T_0to1'],          # [3, 3] 变换矩阵
+            'image0': image0,                  # [1, H, W] fix (固定图)
+            'image1': image1,                  # [1, H, W] moving (形变)
+            'image1_gt': image1_gt,            # [1, H, W] moving (原始未形变)
+            'T_0to1': data['T_0to1'],         # [3, 3] 变换矩阵
             'pair_names': data['pair_names'],
-            'dataset_name': data.get('dataset_name', 'multimodal'),
-            # 关键：MixedDatasetWrapper 混合真实+生成数据时，batch 的所有样本必须有相同 key，
-            # 否则默认 collate 会在缺失 key 的样本上触发 KeyError（例如 'split'）。
-            'split': data.get('split', 'train')
+            'dataset_name': data['dataset_name']
         }
-        
+
         # 添加血管掩码（用于课程学习）
         if 'vessel_mask0' in data:
             result['vessel_mask0'] = data['vessel_mask0']
-        
+
         return result
 
 # ==========================================
-# 辅助类: RealDatasetWrapper (格式转换，用于真实数据训练/验证)
+# 辅助类: RealDatasetWrapper (格式转换，用于真实数据验证)
 # ==========================================
 class RealDatasetWrapper(torch.utils.data.Dataset):
-    """
-    包装 CFFADataset，统一输出格式，可选加载真实血管掩码。
-    
-    vessel_mask_dir: 血管掩码目录 (如 .../vessel_masks_filtered_op)
-        掩码文件命名规则: <subdir_name>_seg.png
-        例如图片在 .../001_01/xxx_01.png → 掩码为 vessel_masks_filtered_op/001_01_seg.png
-    """
-    def __init__(self, base_dataset, split_name='unknown', vessel_mask_dir=None):
+    def __init__(self, base_dataset, split_name='unknown', dataset_name='MultiModal'):
         self.base_dataset = base_dataset
         self.split_name = split_name
-        self.vessel_mask_dir = vessel_mask_dir  # 真实数据的血管掩码目录
+        # 标记来自哪个真实数据集（CFFA / CFOCT / OCTFA）
+        self.dataset_name = dataset_name
         
     def __len__(self):
         return len(self.base_dataset)
@@ -243,54 +259,16 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
             T_fix_to_moving = torch.inverse(T_0to1)
         except:
             T_fix_to_moving = T_0to1
-        
-        result = {
+            
+        return {
             'image0': fix_gray,
             'image1': moving_orig_gray,
             'image1_gt': moving_gray,
             'T_0to1': T_fix_to_moving,
             'pair_names': (fix_name, moving_name),
-            'dataset_name': 'MultiModal',
-            'split': self.split_name
+            'dataset_name': self.dataset_name,
+            'split': self.split_name  # 添加 split 信息
         }
-        
-        # 加载真实血管掩码（用于血管引导训练）
-        # fix_path 形如: .../operation_pre_filtered_cffa/001_01/xxx_01.png
-        # 对应掩码: vessel_masks_filtered_op/001_01_seg.png
-        if self.vessel_mask_dir is not None:
-            try:
-                subdir_name = os.path.basename(os.path.dirname(fix_path))  # e.g. '001_01'
-                mask_filename = f"{subdir_name}_seg.png"
-                mask_path = os.path.join(self.vessel_mask_dir, mask_filename)
-                if os.path.exists(mask_path):
-                    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)  # [H, W], 0/255
-                    # Resize 到 512x512
-                    mask_img = cv2.resize(mask_img, (512, 512), interpolation=cv2.INTER_NEAREST)
-                    # 归一化到 [0, 1]，转为 Float Tensor [1, H, W]
-                    vessel_mask = torch.from_numpy(mask_img.astype(np.float32) / 255.0).unsqueeze(0)
-                    result['vessel_mask0'] = vessel_mask
-            except Exception as e:
-                pass  # 掩码加载失败时忽略，不影响训练
-        
-        return result
-
-# ==========================================
-# 辅助类: MixedDatasetWrapper (合并生成数据+真实数据)
-# ==========================================
-class MixedDatasetWrapper(torch.utils.data.ConcatDataset):
-    """
-    将生成数据集和真实数据集合并为一个大训练集。
-    DataLoader 对其整体 shuffle，使两种数据随机混合进入每个 batch。
-    """
-    def __init__(self, gen_dataset, real_dataset):
-        super().__init__([gen_dataset, real_dataset])
-        self.gen_size = len(gen_dataset)
-        self.real_size = len(real_dataset)
-        logger.info(
-            f"MixedDatasetWrapper: 生成数据 {self.gen_size} 样本 + "
-            f"真实数据 {self.real_size} 样本 = 合计 {len(self)} 样本"
-        )
-
 
 class MultimodalDataModule(pl.LightningDataModule):
     def __init__(self, args, config):
@@ -305,46 +283,44 @@ class MultimodalDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
+            # 训练集使用生成数据 (260305_1_v30)
+            # 验证集合并三个真实数据集的测试集
             # 使用绝对路径确保在任何目录下运行都能找到数据
             script_dir = Path(__file__).parent.parent.parent
-
-            # ========== 训练集：生成数据 + 真实数据混合 ==========
-            # 1. 生成数据 (260227_2_v29_2_1)
-            train_gen_dir = script_dir / 'data' / '260227_2_v29_2_1'
-            train_gen_base = MultiModalDataset(
-                root_dir=str(train_gen_dir), split='train',
-                mode='cffa', img_size=self.args.img_size
+            
+            # 训练集：生成数据 (260305_1_v30) - 支持 cf, fa, oct 随机两两配对
+            train_data_dir = script_dir / 'data' / '260305_1_v30'
+            train_base = MultiModalDataset(
+                root_dir=str(train_data_dir), 
+                split='train', 
+                img_size=self.args.img_size
+                # 默认支持所有模态随机配对
             )
-            train_gen_dataset = GenDatasetWrapper(train_gen_base)
-            logger.info(f"生成数据训练集: {len(train_gen_dataset)} 样本")
-
-            # 2. 真实数据 (operation_pre_filtered_cffa) 训练集
-            #    血管掩码目录: vessel_masks_filtered_op/<subdir>_seg.png
-            real_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            vessel_mask_dir = real_data_dir / 'vessel_masks_filtered_op'
-            train_real_base = CFFADataset(
-                root_dir=str(real_data_dir), split='train', mode='cf2fa'
-            )
-            train_real_dataset = RealDatasetWrapper(
-                train_real_base,
-                split_name='train',
-                vessel_mask_dir=str(vessel_mask_dir)
-            )
-            logger.info(f"真实数据训练集: {len(train_real_dataset)} 样本")
-
-            # 3. 合并为混合训练集（整体随机 shuffle）
-            self.train_dataset = MixedDatasetWrapper(train_gen_dataset, train_real_dataset)
-
-            # ========== 验证集：operation_pre_filtered_cffa 测试集 ==========
-            val_base = CFFADataset(
-                root_dir=str(real_data_dir), split='val', mode='cf2fa'
-            )
-            self.val_dataset = RealDatasetWrapper(
-                val_base,
-                split_name='test',
-                vessel_mask_dir=str(vessel_mask_dir)
-            )
-            logger.info(f"验证集加载 operation_pre_filtered_cffa 测试集: {len(self.val_dataset)} 样本")
+            self.train_dataset = GenDatasetWrapper(train_base, apply_domain_aug=True)
+            logger.info(f"训练集加载 260305_1_v30 生成数据: {len(self.train_dataset)} 样本 (已启用域随机化增强)")
+            
+            # 验证集：合并三个真实数据集的测试集
+            # 1) CFFA 测试集
+            cffa_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
+            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='val', mode='cf2fa')
+            cffa_dataset = RealDatasetWrapper(cffa_base, split_name='test', dataset_name='CFFA')
+            logger.info(f"验证集加载 CFFA 测试集: {len(cffa_dataset)} 样本")
+            
+            # 2) CFOCT 测试集
+            cfoct_dir = script_dir / 'data' / 'operation_pre_filtered_cfoct'
+            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='val', mode='cf2oct')
+            cfoct_dataset = RealDatasetWrapper(cfoct_base, split_name='test', dataset_name='CFOCT')
+            logger.info(f"验证集加载 CFOCT 测试集: {len(cfoct_dataset)} 样本")
+            
+            # 3) OCTFA 测试集
+            octfa_dir = script_dir / 'data' / 'operation_pre_filtered_octfa'
+            octfa_base = OCTFADataset(root_dir=str(octfa_dir), split='val', mode='fa2oct')
+            octfa_dataset = RealDatasetWrapper(octfa_base, split_name='test', dataset_name='OCTFA')
+            logger.info(f"验证集加载 OCTFA 测试集: {len(octfa_dataset)} 样本")
+            
+            # 合并三个验证集
+            self.val_dataset = ConcatDataset([cffa_dataset, cfoct_dataset, octfa_dataset])
+            logger.info(f"验证集总样本数: {len(self.val_dataset)}")
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
@@ -388,7 +364,7 @@ class PL_LightGlue_Gen(pl.LightningModule):
         
         # 使用 ReduceLROnPlateau 调度器
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=10, verbose=True
+            optimizer, mode='max', factor=0.5, patience=self.config.TRAINER.PATIENCE, verbose=True
         )
         return {
             "optimizer": optimizer,
@@ -699,8 +675,10 @@ class MultimodalValidationCallback(Callback):
         val_dataloader = trainer.val_dataloaders[0] if isinstance(trainer.val_dataloaders, list) else trainer.val_dataloaders
         pl_module.eval()
         
-        visualized_count = 0
-        max_visualize = 20  # 最多可视化 20 个测试集样本
+        # 每种验证数据集最多可视化的样本数
+        max_per_dataset = 5
+        per_dataset_counts = {}
+        total_visualized = 0
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_dataloader):
@@ -710,25 +688,35 @@ class MultimodalValidationCallback(Callback):
                 # 只可视化测试集样本
                 batch_size = batch['image0'].shape[0]
                 splits = batch.get('split', ['unknown'] * batch_size)
+                dataset_names = batch.get('dataset_name', ['unknown'] * batch_size)
                 
                 for i in range(batch_size):
                     sample_split = splits[i] if isinstance(splits, list) else splits
+                    sample_dataset = dataset_names[i] if isinstance(dataset_names, list) else dataset_names
                     
                     # 只可视化 test split
                     if sample_split == 'test':
-                        self._process_batch_sample(trainer, pl_module, batch, outputs, target_dir, i, batch_idx, sample_split)
-                        visualized_count += 1
+                        cur_count = per_dataset_counts.get(sample_dataset, 0)
+                        if cur_count < max_per_dataset:
+                            self._process_batch_sample(
+                                trainer, pl_module, batch, outputs,
+                                target_dir, i, batch_idx,
+                                sample_split, sample_dataset
+                            )
+                            per_dataset_counts[sample_dataset] = cur_count + 1
+                            total_visualized += 1
                         
-                        if visualized_count >= max_visualize:
+                        # 三个验证集都达到上限就停止
+                        if len(per_dataset_counts) >= 3 and all(c >= max_per_dataset for c in per_dataset_counts.values()):
                             break
                 
-                if visualized_count >= max_visualize:
+                if len(per_dataset_counts) >= 3 and all(c >= max_per_dataset for c in per_dataset_counts.values()):
                     break
         
-        logger.info(f"已可视化 {visualized_count} 个测试集样本")
+        logger.info(f"已可视化 {total_visualized} 个测试集样本, 按数据集统计: {per_dataset_counts}")
         pl_module.force_viz = False
 
-    def _process_batch_sample(self, trainer, pl_module, batch, outputs, epoch_dir, sample_idx, batch_idx, split):
+    def _process_batch_sample(self, trainer, pl_module, batch, outputs, epoch_dir, sample_idx, batch_idx, split, dataset_name='unknown'):
         """处理并可视化单个样本"""
         H_ests = outputs.get('H_est', [np.eye(3)] * batch['image0'].shape[0])
         H_est = H_ests[sample_idx]
@@ -748,7 +736,7 @@ class MultimodalValidationCallback(Callback):
         except:
             img1_result = img1.copy()
         
-        sample_name = f"batch{batch_idx:04d}_sample{sample_idx:02d}_{split}_{Path(batch['pair_names'][0][sample_idx]).stem}_vs_{Path(batch['pair_names'][1][sample_idx]).stem}"
+        sample_name = f"{dataset_name}_batch{batch_idx:04d}_sample{sample_idx:02d}_{split}_{Path(batch['pair_names'][0][sample_idx]).stem}_vs_{Path(batch['pair_names'][1][sample_idx]).stem}"
         save_path = epoch_dir / sample_name
         save_path.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(save_path / "fix.png"), img0)
@@ -874,6 +862,7 @@ def parse_args():
     parser.add_argument('--weaning_end', type=int, default=100, help='断奶期结束 epoch')
     parser.add_argument('--max_vessel_weight', type=float, default=10.0, help='血管权重最大值')
     parser.add_argument('--min_vessel_weight', type=float, default=1.0, help='血管权重最小值')
+    parser.add_argument('--patience', type=int, default=10, help='早停和学习率调度的 patience 值')
     
     return parser.parse_args()
 
@@ -883,6 +872,7 @@ def main():
     
     config = get_default_config()
     config.TRAINER.SEED = 66
+    config.TRAINER.PATIENCE = args.patience  # 使用传入的 patience 值
     pl.seed_everything(config.TRAINER.SEED)
     
     # 修复路径
@@ -931,7 +921,7 @@ def main():
         start_epoch=0,
         monitor='combined_auc',
         mode='max',
-        patience=10,
+        patience=args.patience,
         min_delta=0.0001,
         strict=False
     )
@@ -950,7 +940,7 @@ def main():
     logger.info(f"课程学习配置: Teaching[0-{args.teaching_end}]={args.max_vessel_weight}, "
                 f"Weaning[{args.teaching_end}-{args.weaning_end}]={args.max_vessel_weight}->{args.min_vessel_weight}, "
                 f"Independence[{args.weaning_end}+]={args.min_vessel_weight}")
-    logger.info(f"早停配置: monitor=combined_auc, start_epoch=0, patience=10, min_delta=0.0001")
+    logger.info(f"早停配置: monitor=combined_auc, start_epoch=0, patience={args.patience}, min_delta=0.0001")
     logger.info("=" * 80)
     
     # 确保 args 有 mode 属性（用于回调）
@@ -985,8 +975,8 @@ def main():
     # 如果指定了检查点，从检查点恢复
     ckpt_path = args.start_point if args.start_point else None
     
-    logger.info(f"开始训练 (训练集: 生成数据 + 真实数据混合 | 验证集: CFFA 真实数据): {args.name}")
-    logger.info("策略: 真实+生成混合训练 + 血管loss引导的课程学习")
+    logger.info(f"开始训练 (训练集: 260305_1_v30 生成数据 | 验证集: CFFA+CFOCT+OCTFA 合并真实数据): {args.name}")
+    logger.info("策略: 血管loss引导的课程学习")
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
 if __name__ == '__main__':
