@@ -187,12 +187,20 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
         return result
 
 # ==========================================
-# 辅助类: RealDatasetWrapper (格式转换，用于真实数据验证)
+# 辅助类: RealDatasetWrapper (格式转换，用于真实数据训练/验证)
 # ==========================================
 class RealDatasetWrapper(torch.utils.data.Dataset):
-    def __init__(self, base_dataset, split_name='unknown'):
+    """
+    包装 CFFADataset，统一输出格式，可选加载真实血管掩码。
+    
+    vessel_mask_dir: 血管掩码目录 (如 .../vessel_masks_filtered_op)
+        掩码文件命名规则: <subdir_name>_seg.png
+        例如图片在 .../001_01/xxx_01.png → 掩码为 vessel_masks_filtered_op/001_01_seg.png
+    """
+    def __init__(self, base_dataset, split_name='unknown', vessel_mask_dir=None):
         self.base_dataset = base_dataset
         self.split_name = split_name
+        self.vessel_mask_dir = vessel_mask_dir  # 真实数据的血管掩码目录
         
     def __len__(self):
         return len(self.base_dataset)
@@ -232,16 +240,54 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
             T_fix_to_moving = torch.inverse(T_0to1)
         except:
             T_fix_to_moving = T_0to1
-            
-        return {
+        
+        result = {
             'image0': fix_gray,
             'image1': moving_orig_gray,
             'image1_gt': moving_gray,
             'T_0to1': T_fix_to_moving,
             'pair_names': (fix_name, moving_name),
             'dataset_name': 'MultiModal',
-            'split': self.split_name  # 添加 split 信息
+            'split': self.split_name
         }
+        
+        # 加载真实血管掩码（用于血管引导训练）
+        # fix_path 形如: .../operation_pre_filtered_cffa/001_01/xxx_01.png
+        # 对应掩码: vessel_masks_filtered_op/001_01_seg.png
+        if self.vessel_mask_dir is not None:
+            try:
+                subdir_name = os.path.basename(os.path.dirname(fix_path))  # e.g. '001_01'
+                mask_filename = f"{subdir_name}_seg.png"
+                mask_path = os.path.join(self.vessel_mask_dir, mask_filename)
+                if os.path.exists(mask_path):
+                    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)  # [H, W], 0/255
+                    # Resize 到 512x512
+                    mask_img = cv2.resize(mask_img, (512, 512), interpolation=cv2.INTER_NEAREST)
+                    # 归一化到 [0, 1]，转为 Float Tensor [1, H, W]
+                    vessel_mask = torch.from_numpy(mask_img.astype(np.float32) / 255.0).unsqueeze(0)
+                    result['vessel_mask0'] = vessel_mask
+            except Exception as e:
+                pass  # 掩码加载失败时忽略，不影响训练
+        
+        return result
+
+# ==========================================
+# 辅助类: MixedDatasetWrapper (合并生成数据+真实数据)
+# ==========================================
+class MixedDatasetWrapper(torch.utils.data.ConcatDataset):
+    """
+    将生成数据集和真实数据集合并为一个大训练集。
+    DataLoader 对其整体 shuffle，使两种数据随机混合进入每个 batch。
+    """
+    def __init__(self, gen_dataset, real_dataset):
+        super().__init__([gen_dataset, real_dataset])
+        self.gen_size = len(gen_dataset)
+        self.real_size = len(real_dataset)
+        logger.info(
+            f"MixedDatasetWrapper: 生成数据 {self.gen_size} 样本 + "
+            f"真实数据 {self.real_size} 样本 = 合计 {len(self)} 样本"
+        )
+
 
 class MultimodalDataModule(pl.LightningDataModule):
     def __init__(self, args, config):
@@ -256,30 +302,45 @@ class MultimodalDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
-            # 训练集使用生成数据 + 真实数据混合
-            # 验证集使用 operation_pre_filtered_cffa 测试集
             # 使用绝对路径确保在任何目录下运行都能找到数据
             script_dir = Path(__file__).parent.parent.parent
 
-            # ========== 训练集：生成数据 + 真实数据 ==========
+            # ========== 训练集：生成数据 + 真实数据混合 ==========
             # 1. 生成数据 (260227_2_v29_2_1)
             train_gen_dir = script_dir / 'data' / '260227_2_v29_2_1'
-            train_gen_base = MultiModalDataset(root_dir=str(train_gen_dir), split='train', mode='cffa', img_size=self.args.img_size)
+            train_gen_base = MultiModalDataset(
+                root_dir=str(train_gen_dir), split='train',
+                mode='cffa', img_size=self.args.img_size
+            )
             train_gen_dataset = GenDatasetWrapper(train_gen_base)
+            logger.info(f"生成数据训练集: {len(train_gen_dataset)} 样本")
 
-            # 2. 真实数据 (operation_pre_filtered_cffa)
-            train_real_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            vessel_mask_dir = train_real_dir / 'vessel_masks_filtered_op'
-            train_real_base = CFFADataset(root_dir=str(train_real_dir), split='train', mode='cf2fa')
-            train_real_dataset = RealDatasetWrapper(train_real_base, split_name='train', vessel_mask_dir=str(vessel_mask_dir))
+            # 2. 真实数据 (operation_pre_filtered_cffa) 训练集
+            #    血管掩码目录: vessel_masks_filtered_op/<subdir>_seg.png
+            real_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
+            vessel_mask_dir = real_data_dir / 'vessel_masks_filtered_op'
+            train_real_base = CFFADataset(
+                root_dir=str(real_data_dir), split='train', mode='cf2fa'
+            )
+            train_real_dataset = RealDatasetWrapper(
+                train_real_base,
+                split_name='train',
+                vessel_mask_dir=str(vessel_mask_dir)
+            )
+            logger.info(f"真实数据训练集: {len(train_real_dataset)} 样本")
 
-            # 3. 合并为混合训练集
+            # 3. 合并为混合训练集（整体随机 shuffle）
             self.train_dataset = MixedDatasetWrapper(train_gen_dataset, train_real_dataset)
 
             # ========== 验证集：operation_pre_filtered_cffa 测试集 ==========
-            val_data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            val_base = CFFADataset(root_dir=str(val_data_dir), split='val', mode='cf2fa')
-            self.val_dataset = RealDatasetWrapper(val_base, split_name='test', vessel_mask_dir=str(vessel_mask_dir))
+            val_base = CFFADataset(
+                root_dir=str(real_data_dir), split='val', mode='cf2fa'
+            )
+            self.val_dataset = RealDatasetWrapper(
+                val_base,
+                split_name='test',
+                vessel_mask_dir=str(vessel_mask_dir)
+            )
             logger.info(f"验证集加载 operation_pre_filtered_cffa 测试集: {len(self.val_dataset)} 样本")
 
     def train_dataloader(self):
@@ -921,8 +982,8 @@ def main():
     # 如果指定了检查点，从检查点恢复
     ckpt_path = args.start_point if args.start_point else None
     
-    logger.info(f"开始训练 (训练集: 260227_2_v29_2_1 生成数据 | 验证集: CFFA 真实数据): {args.name}")
-    logger.info("策略: 血管loss引导的课程学习")
+    logger.info(f"开始训练 (训练集: 生成数据 + 真实数据混合 | 验证集: CFFA 真实数据): {args.name}")
+    logger.info("策略: 真实+生成混合训练 + 血管loss引导的课程学习")
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
 if __name__ == '__main__':
