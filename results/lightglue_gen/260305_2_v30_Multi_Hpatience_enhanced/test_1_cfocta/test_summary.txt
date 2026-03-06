@@ -1,0 +1,34 @@
+测试总结
+==================================================
+Train Script: train_onMultiGen_vessels_enhanced
+Test Name: test_1_cfocta
+Model Name: 260305_2_v30_Multi_Hpatience_enhanced
+Test Datasets: CFOCTA
+
+--- Overall Metrics ---
+总样本数: 28
+匹配成功样本数: 28
+匹配失败样本数: 0
+匹配失败率: 0.0000
+Inaccurate 样本数: 0
+Acceptable 样本数: 28
+MSE (仅 Acceptable): 7.533070
+MACE (仅 Acceptable): 23.4419
+AUC@5: 0.0000
+AUC@10: 0.0000
+AUC@20: 0.0945
+mAUC: 0.1743
+Combined AUC: 0.0315
+Inverse MACE: 0.040913
+
+--- Per-Dataset Metrics ---
+
+CFOCTA:
+  样本数: 28
+  AUC@5: 0.0000
+  AUC@10: 0.0000
+  AUC@20: 0.0945
+  mAUC: 0.1743
+  Combined AUC: 0.0315
+  MSE: 7.533070
+  MACE: 23.4419

@@ -1,0 +1,34 @@
+测试总结
+==================================================
+Train Script: train_onMultiGen_vessels_enhanced
+Test Name: test_1_cffa
+Model Name: 260305_2_v30_Multi_Hpatience_enhanced
+Test Datasets: CFFA
+
+--- Overall Metrics ---
+总样本数: 19
+匹配成功样本数: 19
+匹配失败样本数: 0
+匹配失败率: 0.0000
+Inaccurate 样本数: 1
+Acceptable 样本数: 18
+MSE (仅 Acceptable): 6.768879
+MACE (仅 Acceptable): 14.6192
+AUC@5: 0.1819
+AUC@10: 0.3545
+AUC@20: 0.5663
+mAUC: 0.6126
+Combined AUC: 0.3676
+Inverse MACE: 0.064024
+
+--- Per-Dataset Metrics ---
+
+CFFA:
+  样本数: 19
+  AUC@5: 0.1819
+  AUC@10: 0.3545
+  AUC@20: 0.5663
+  mAUC: 0.6126
+  Combined AUC: 0.3676
+  MSE: 6.768879
+  MACE: 14.6192

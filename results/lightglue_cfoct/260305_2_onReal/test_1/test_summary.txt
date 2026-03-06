@@ -1,0 +1,33 @@
+测试总结
+==================================================
+Train Script: train_onReal
+Test Name: test_1
+Model Name: 260305_2_onReal
+
+--- Overall Metrics ---
+总样本数: 7
+匹配成功样本数: 7
+匹配失败样本数: 0
+匹配失败率: 0.0000
+Inaccurate 样本数: 0
+Acceptable 样本数: 7
+MSE (仅 Acceptable): 4.422633
+MACE (仅 Acceptable): 14.1755
+AUC@5: 0.1516
+AUC@10: 0.2187
+AUC@20: 0.4022
+mAUC: 0.4571
+Combined AUC: 0.2575
+Inverse MACE: 0.065896
+
+--- Per-Dataset Metrics ---
+
+CFOCT:
+  样本数: 7
+  AUC@5: 0.1516
+  AUC@10: 0.2187
+  AUC@20: 0.4022
+  mAUC: 0.4571
+  Combined AUC: 0.2575
+  MSE: 4.422633
+  MACE: 14.1755
