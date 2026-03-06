@@ -168,65 +168,86 @@ class CFOCTADataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        
+
         # 1. 加载原始图像
         cf_pil = Image.open(s['cf_path']).convert("RGB")
         octa_pil = Image.open(s['octa_path']).convert("RGB")
-        
+
         # CF转为灰度图
         cf_pil = cf_pil.convert("L").convert("RGB")
-        
+
         cf_np = np.array(cf_pil)
         octa_np = np.array(octa_pil)
-        
+
+        # 获取原始尺寸
+        h_cf, w_cf = cf_np.shape[:2]
+        h_octa, w_octa = octa_np.shape[:2]
+
         # 2. 确定 fix 和 moving: cfocta -> fix=CF, moving=OCTA
         fix_np = cf_np
         moving_np = octa_np
-        affine_path = s['affine_octa2cf']  # 配准 OCTA 到 CF 空间
+        affine_path = s['affine_octa2cf']  # GT_OCTA_to_CF，OCTA -> CF
         fix_path = s['cf_path']
         moving_path = s['octa_path']
-        
-        # 3. 计算配准后的moving_gt
-        T_0to1 = np.eye(3, dtype=np.float32)
-        if affine_path and os.path.exists(affine_path):
-            affine_matrix = load_affine_matrix(affine_path)
-            if affine_matrix is not None:
-                moving_gt_np, T_0to1 = apply_affine_registration(moving_np, affine_matrix, output_size=(SIZE, SIZE))
-            else:
-                moving_gt_np = moving_np.copy()
-        else:
-            moving_gt_np = moving_np.copy()
-        
-        # 4. 移除裁剪逻辑，直接 Resize 并补偿尺度
-        fix_filtered = fix_np
-        moving_gt_filtered = moving_gt_np
-        
-        # 准备原始moving
-        moving_original_pil = Image.fromarray(moving_np).resize((SIZE, SIZE), Image.BICUBIC)
-        
-        # 计算尺度补偿 (从原始尺寸到 512)
-        h_orig, w_orig = fix_filtered.shape[:2]
-        sx = SIZE / float(w_orig)
-        sy = SIZE / float(h_orig)
-        T_scale = np.array([
-            [sx, 0, 0],
-            [0, sy, 0],
-            [0, 0, 1]
-        ], dtype=np.float32)
-        T_0to1 = T_scale @ T_0to1
 
-        fix_pil = Image.fromarray(fix_filtered).resize((SIZE, SIZE), Image.BICUBIC)
-        moving_gt_pil = Image.fromarray(moving_gt_filtered).resize((SIZE, SIZE), Image.BICUBIC)
+        # 3. 计算配准后的 moving_gt
+        # GT 矩阵将 OCTA 配准到 CF 空间
+        # moving_gt 应该与 fix (CF) 对齐
         
-        # 5. Tensor 转换
+        # 默认 T_0to1 为单位矩阵（表示 moving 已对齐到 fix）
+        T_0to1 = np.eye(3, dtype=np.float32)
+
+        if affine_path and os.path.exists(affine_path):
+            affine_matrix = load_affine_matrix(affine_path)  # 2x3, 基于 256x256
+            if affine_matrix is not None:
+                # ====== 正确计算：使用与 _1.py 一致的方法 ======
+                # 原始矩阵是基于 256x256 尺寸定义的，需要将其映射到 OCTA 图像尺寸
+                # 注意：OCTA 图像是 400x400，CF 图像是 256x256
+                scale_x = w_octa / 256.0
+                scale_y = h_octa / 256.0
+                
+                # 调整仿射矩阵以适应当前图像尺寸
+                M = affine_matrix.copy()
+                M[0, 2] *= scale_x
+                M[1, 2] *= scale_y
+                
+                moving_gt_at_octa_size = cv2.warpAffine(
+                    moving_np,
+                    M,  # 调整后的矩阵
+                    (w_octa, h_octa),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0
+                )
+
+                # resize 到 512x512
+                moving_gt_np = cv2.resize(moving_gt_at_octa_size, (SIZE, SIZE), interpolation=cv2.INTER_LINEAR)
+                
+                # T_0to1 保持为单位矩阵，因为 moving_gt 已经配准到 CF 空间
+                # MACE 计算时直接比较 moving_gt 和 fix（都是 CF 空间）
+            else:
+                # 没有有效的 GT 矩阵，只做 resize
+                moving_gt_np = cv2.resize(moving_np, (SIZE, SIZE), interpolation=cv2.INTER_LINEAR)
+        else:
+            # 没有 GT 矩阵，只做 resize
+            moving_gt_np = cv2.resize(moving_np, (SIZE, SIZE), interpolation=cv2.INTER_LINEAR)
+
+        # 4. resize fix 图像到 512x512
+        fix_pil = Image.fromarray(fix_np).resize((SIZE, SIZE), Image.BICUBIC)
         fix_tensor = transforms.ToTensor()(fix_pil)
+
+        # 5. 准备原始 moving 图像 (resize 到 512)
+        moving_original_pil = Image.fromarray(moving_np).resize((SIZE, SIZE), Image.BICUBIC)
         moving_original_tensor = transforms.ToTensor()(moving_original_pil)
-        moving_gt_tensor = transforms.ToTensor()(moving_gt_pil)
-        
-        # 6. 归一化
+
+        # 6. moving_gt 已经 resize 过了，直接转为 tensor
+        moving_gt_tensor = transforms.ToTensor()(Image.fromarray(moving_gt_np))
+
+        # 7. 归一化
         moving_original_tensor = moving_original_tensor * 2 - 1
         moving_gt_tensor = moving_gt_tensor * 2 - 1
-        
+
+        # T_0to1 是单位矩阵，因为 moving_gt 已经配准到 CF 空间
         return fix_tensor, moving_original_tensor, moving_gt_tensor, fix_path, moving_path, torch.from_numpy(T_0to1)
 
     def get_raw_sample(self, idx):
@@ -262,3 +283,56 @@ class CFOCTADataset(Dataset):
             return img_cf, img_octa, pts_cf, pts_octa, cf_path, octa_path
         else: # octa2cf
             return img_octa, img_cf, pts_octa, pts_cf, octa_path, cf_path
+
+    def get_sample_with_gt(self, idx):
+        """返回包含 GT 配准后图像的样本（用于测试可视化）"""
+        s = self.samples[idx]
+
+        # 加载原始图像
+        cf_pil = Image.open(s['cf_path']).convert("RGB")
+        octa_pil = Image.open(s['octa_path']).convert("RGB")
+
+        # CF转为灰度图
+        cf_pil = cf_pil.convert("L").convert("RGB")
+
+        cf_np = np.array(cf_pil)
+        octa_np = np.array(octa_pil)
+
+        # 获取原始尺寸
+        h_cf, w_cf = cf_np.shape[:2]
+        h_octa, w_octa = octa_np.shape[:2]
+
+        # fix = CF, moving = OCTA
+        fix_np = cf_np
+        moving_np = octa_np
+        affine_path = s['affine_octa2cf']
+
+        # 计算 moving_gt (OCTA 用 GT 矩阵变换到 CF 域)
+        moving_gt_np = moving_np.copy()  # 默认
+
+        if affine_path and os.path.exists(affine_path):
+            affine_matrix = load_affine_matrix(affine_path)
+            if affine_matrix is not None:
+                # 调整仿射矩阵以适应当前图像尺寸 (OCTA 是 400x400)
+                scale_x = w_octa / 256.0
+                scale_y = h_octa / 256.0
+                M = affine_matrix.copy()
+                M[0, 2] *= scale_x
+                M[1, 2] *= scale_y
+                
+                moving_gt_at_octa_size = cv2.warpAffine(
+                    moving_np,
+                    M,
+                    (w_octa, h_octa),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0
+                )
+                moving_gt_np = moving_gt_at_octa_size
+
+        # resize 到 512x512
+        fix_512 = cv2.resize(fix_np, (SIZE, SIZE), interpolation=cv2.INTER_LINEAR)
+        moving_512 = cv2.resize(moving_np, (SIZE, SIZE), interpolation=cv2.INTER_LINEAR)
+        moving_gt_512 = cv2.resize(moving_gt_np, (SIZE, SIZE), interpolation=cv2.INTER_LINEAR)
+
+        return fix_512, moving_512, moving_gt_512

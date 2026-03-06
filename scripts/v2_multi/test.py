@@ -19,8 +19,12 @@ import pytorch_lightning as pl
 from torch.utils.data import ConcatDataset, DataLoader
 import csv
 
-# 添加父目录到 sys.path
+# 添加父目录到 sys.path（必须在前，因为 lightglue 是本地模块）
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+
+# 导入 LightGlue 预训练模型
+from lightglue import LightGlue
+from lightglue.superpoint import SuperPoint
 
 from scripts.v2.metrics import (
     compute_homography_errors,
@@ -33,6 +37,7 @@ from scripts.v2.metrics import (
 from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
 from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+from data.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
 
 
 def is_valid_homography(H, scale_min=0.1, scale_max=10.0, perspective_threshold=0.005):
@@ -144,6 +149,13 @@ class TestDataModule:
             octfa_dataset = RealDatasetWrapper(octfa_base, split_name='test', dataset_name='OCTFA')
             logger.info(f"加载 OCTFA 测试集: {len(octfa_dataset)} 样本")
             val_dataset_list.append(octfa_dataset)
+
+        if datasets is None or 'CFOCTA' in datasets:
+            cfocta_dir = script_dir / 'data' / 'CF_OCTA_v2_repaired'
+            cfocta_base = CFOCTADataset(root_dir=str(cfocta_dir), split='val', mode='cf2octa')
+            cfocta_dataset = RealDatasetWrapper(cfocta_base, split_name='test', dataset_name='CFOCTA')
+            logger.info(f"加载 CFOCTA 测试集: {len(cfocta_dataset)} 样本")
+            val_dataset_list.append(cfocta_dataset)
 
         val_dataset = ConcatDataset(val_dataset_list)
         logger.info(f"测试集总样本数: {len(val_dataset)}")
@@ -439,6 +451,14 @@ def _visualize_batch(batch, outputs, output_dir, batch_idx):
         try:
             cb = create_chessboard(img1_result, img0)
             cv2.imwrite(str(save_path / "chessboard.png"), cb)
+
+            # 额外保存：moving_gt vs fix 的 chessboard
+            cb_gt_vs_fix = create_chessboard(img1_gt, img0)
+            cv2.imwrite(str(save_path / "chessboard_gt_vs_fix.png"), cb_gt_vs_fix)
+
+            # 额外保存：moving_gt vs moving_pred 的 chessboard
+            cb_gt_vs_pred = create_chessboard(img1_gt, img1_result)
+            cv2.imwrite(str(save_path / "chessboard_gt_vs_pred.png"), cb_gt_vs_pred)
         except:
             pass
 
@@ -510,14 +530,18 @@ def parse_args():
                                 'train_onMultiGen_vessels', 'train_onReal'],
                         help='训练脚本名称')
 
-    # train_onGen 专用参数
+    # train_onGen/Real 专用参数
     parser.add_argument('--train_mode', '-m', type=str, default='mixed',
                         choices=['cffa', 'cfoct', 'octfa', 'mixed'],
                         help='训练模式: cffa, cfoct, octfa (train_onReal仅支持这三个)')
 
     # 测试数据集选择 (用于混合模式测试时指定数据集)
     parser.add_argument('--test_datasets', '-d', type=str, default=None,
-                        help='指定测试数据集，用逗号分隔，如 "CFFA,CFOCT,OCTFA" 或 "CFFA"')
+                        help='指定测试数据集，用逗号分隔，如 "CFFA,CFOCT,OCTFA,CFOCTA" 或 "CFFA"')
+
+    # Baseline 模式：使用 LightGlue 原生预训练权重
+    parser.add_argument('--baseline', action='store_true',
+                        help='使用 LightGlue 原生预训练权重（不加载训练好的检查点）')
 
     parser.add_argument('--name', '-n', type=str, required=True,
                         help='模型名称（用于定位结果目录）')
@@ -612,13 +636,78 @@ def main():
     logger.info(f"输出目录: {output_dir}")
     logger.info(f"GPU配置: devices={gpus_list}, num_gpus={_n_gpus}")
 
-    # 从检查点加载模型
-    model = pl_class.load_from_checkpoint(
-        str(ckpt_path),
-        config=config,
-        result_dir=str(output_dir)
-    )
-    model.eval()
+    # 从检查点加载模型 或 使用 baseline 预训练权重
+    if args.baseline:
+        logger.info("=" * 50)
+        logger.info("BASELINE 模式：使用 LightGlue 原生预训练权重")
+        logger.info("=" * 50)
+
+        # 创建 baseline 模型包装类
+        class BaselineLightGlueModel(pl.LightningModule):
+            """使用 LightGlue 原生预训练权重的 baseline 模型"""
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+
+                # 1. 特征提取器 (SuperPoint) - 冻结，使用预训练
+                self.extractor = SuperPoint(max_num_keypoints=2048).eval()
+                for param in self.extractor.parameters():
+                    param.requires_grad = False
+
+                # 2. 匹配器 (LightGlue) - 使用预训练权重
+                lg_conf = config.MATCHING.copy()
+                # 强制加载预训练权重
+                lg_conf['weights'] = 'superpoint_lightglue'
+                self.matcher = LightGlue(**lg_conf).eval()
+                for param in self.matcher.parameters():
+                    param.requires_grad = False
+
+                # 使用统一的评估器
+                self.evaluator = UnifiedEvaluator(config=config)
+
+            def forward(self, batch):
+                """前向传播"""
+                # 提取特征
+                with torch.no_grad():
+                    if 'keypoints0' not in batch:
+                        feats0 = self.extractor({'image': batch['image0']})
+                        feats1 = self.extractor({'image': batch['image1']})
+                        batch.update({
+                            'keypoints0': feats0['keypoints'],
+                            'descriptors0': feats0['descriptors'],
+                            'scores0': feats0['keypoint_scores'],
+                            'keypoints1': feats1['keypoints'],
+                            'descriptors1': feats1['descriptors'],
+                            'scores1': feats1['keypoint_scores']
+                        })
+
+                # LightGlue 匹配
+                data = {
+                    'image0': {
+                        'keypoints': batch['keypoints0'],
+                        'descriptors': batch['descriptors0'],
+                        'image': batch['image0']
+                    },
+                    'image1': {
+                        'keypoints': batch['keypoints1'],
+                        'descriptors': batch['descriptors1'],
+                        'image': batch['image1']
+                    }
+                }
+
+                return self.matcher(data)
+
+        model = BaselineLightGlueModel(config)
+        model.eval()
+        logger.info("已加载 LightGlue 原生预训练权重 (superpoint_lightglue)")
+    else:
+        logger.info(f"加载检查点: {ckpt_path}")
+        model = pl_class.load_from_checkpoint(
+            str(ckpt_path),
+            config=config,
+            result_dir=str(output_dir)
+        )
+        model.eval()
 
     # 初始化测试数据模块
     test_dm = TestDataModule(args)

@@ -338,6 +338,14 @@ def _visualize_batch(batch, outputs, output_dir, batch_idx):
         try:
             cb = create_chessboard(img1_result, img0)
             cv2.imwrite(str(save_path / "chessboard.png"), cb)
+
+            # 额外保存：moving_gt vs fix 的 chessboard
+            cb_gt_vs_fix = create_chessboard(img1_gt, img0)
+            cv2.imwrite(str(save_path / "chessboard_gt_vs_fix.png"), cb_gt_vs_fix)
+
+            # 额外保存：moving_gt vs moving_pred 的 chessboard
+            cb_gt_vs_pred = create_chessboard(img1_gt, img1_result)
+            cv2.imwrite(str(save_path / "chessboard_gt_vs_pred.png"), cb_gt_vs_pred)
         except:
             pass
         
