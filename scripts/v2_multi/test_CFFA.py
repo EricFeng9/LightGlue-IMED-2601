@@ -17,8 +17,9 @@ import pytorch_lightning as pl
 # 添加父目录到 sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from scripts.v2.metrics import (
-    compute_homography_errors, 
+# 导入 metrics（使用 v2_multi 版本，与 v2 版本内容相同但保持一致性）
+from scripts.v2_multi.metrics import (
+    compute_homography_errors,
     set_metrics_verbose,
     error_auc,
     compute_auc_rop

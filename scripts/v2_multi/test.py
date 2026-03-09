@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from lightglue import LightGlue
 from lightglue.superpoint import SuperPoint
 
-from scripts.v2.metrics import (
+# 导入 metrics（使用 v2_multi 版本的 metrics，与训练保持一致）
+from scripts.v2_multi.metrics import (
     compute_homography_errors,
     set_metrics_verbose,
     error_auc,
@@ -188,7 +189,13 @@ def compute_metrics_for_dataset(evaluator, dataset_name):
 
 class UnifiedEvaluator:
     """统一的评估器，支持按数据集分别计算指标"""
-    def __init__(self, config=None):
+    def __init__(self, mode='gen', config=None):
+        """
+        Args:
+            mode: 'gen' 或 'real'，用于保持兼容性
+            config: 配置对象，包含 TRAINER.RANSAC_PIXEL_THR 等参数
+        """
+        self.mode = mode
         self.config = config
         self.reset()
 

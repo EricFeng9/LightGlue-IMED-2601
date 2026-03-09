@@ -31,8 +31,8 @@ from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import
 from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
-# 导入统一的测试/验证模块
-from scripts.v2.test import UnifiedEvaluator
+# 导入统一的测试/验证模块（使用 v2_multi 版本，与 metrics 保持一致）
+from scripts.v2_multi.test import UnifiedEvaluator
 
 # ==========================================
 # 配置函数
@@ -205,9 +205,9 @@ class MultimodalDataModule(pl.LightningDataModule):
                 self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
                 logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFOCT)")
 
-                # 验证集（使用测试集）
-                val_base = CFOCTDataset(root_dir=str(data_dir), split='test', mode='cf2oct')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
+                # 验证集（统一使用 val）
+                val_base = CFOCTDataset(root_dir=str(data_dir), split='val', mode='cf2oct')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='val')
                 logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (CFOCT)")
             elif self.args.mode == 'octfa':
                 # OCTFA 模式: OCT 为 fix, FA 为 moving
@@ -218,9 +218,9 @@ class MultimodalDataModule(pl.LightningDataModule):
                 self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
                 logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (OCTFA)")
 
-                # 验证集（使用测试集）
-                val_base = OCTFADataset(root_dir=str(data_dir), split='test', mode='fa2oct')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
+                # 验证集（统一使用 val）
+                val_base = OCTFADataset(root_dir=str(data_dir), split='val', mode='fa2oct')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='val')
                 logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (OCTFA)")
             else:
                 # CFFA 模式 (默认): CF 为 fix, FA 为 moving
@@ -231,9 +231,9 @@ class MultimodalDataModule(pl.LightningDataModule):
                 self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
                 logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFFA)")
 
-                # 验证集（使用测试集）
+                # 验证集（统一使用 val）
                 val_base = CFFADataset(root_dir=str(data_dir), split='val', mode='cf2fa')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='val')
                 logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (CFFA)")
 
     def train_dataloader(self):

@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from lightglue import LightGlue
 from lightglue.superpoint import SuperPoint
 
-from scripts.v2.metrics import (
+# 导入 metrics（使用 v2_multi 版本的 metrics，与训练保持一致）
+from scripts.v2_multi.metrics import (
     compute_homography_errors,
     set_metrics_verbose,
     error_auc,

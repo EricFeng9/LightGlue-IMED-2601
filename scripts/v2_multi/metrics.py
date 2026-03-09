@@ -96,7 +96,9 @@ def compute_symmetrical_epipolar_errors(data):
         data (dict):{"epi_errs": [M]}
     """
     dataset_name = data['dataset_name'][0].lower()
-    if dataset_name == 'multimodal' or dataset_name == 'realdataset':
+    # 添加对医学眼底多模态数据集的支持（CFFA, CFOCT, OCTFA, CFOCTA）
+    multimodal_datasets = ['multimodal', 'realdataset', 'cffa', 'cfoct', 'octfa', 'cfocta']
+    if dataset_name in multimodal_datasets:
         return compute_homography_reprojection_errors(data)
     
     Tx = numeric.cross_product_matrix(data['T_0to1'][:, :3, 3])
@@ -188,7 +190,9 @@ def compute_pose_errors(data, config):
         }
     """
     dataset_name = data['dataset_name'][0].lower()
-    if dataset_name == 'multimodal' or dataset_name == 'realdataset':
+    # 添加对医学眼底多模态数据集的支持（CFFA, CFOCT, OCTFA, CFOCTA）
+    multimodal_datasets = ['multimodal', 'realdataset', 'cffa', 'cfoct', 'octfa', 'cfocta']
+    if dataset_name in multimodal_datasets:
         return compute_homography_errors(data, config)
     
     pixel_thr = config.TRAINER.RANSAC_PIXEL_THR  # 0.5

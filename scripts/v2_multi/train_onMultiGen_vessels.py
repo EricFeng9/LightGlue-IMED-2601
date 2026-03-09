@@ -43,8 +43,8 @@ from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import
 from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
-# 导入统一的测试/验证模块
-from scripts.v2.test import UnifiedEvaluator
+# 导入统一的测试/验证模块（使用 v2_multi 版本，与 metrics 保持一致）
+from scripts.v2_multi.test import UnifiedEvaluator
 
 # ==========================================
 # 配置函数
