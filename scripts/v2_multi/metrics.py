@@ -356,14 +356,15 @@ def compute_homography_errors(data, config):
         _dual_log("INFO", f"🔍 Batch {bs}: 总匹配点={num_matches}, Spatial Binning后={len(bin_indices)}")
         
         ransac_thr = float(getattr(getattr(config, 'TRAINER', object()), 'RANSAC_PIXEL_THR', 3.0))
+        # 【修复】inliers_rate 分母必须使用全部匹配点数
+        denom_inliers = len(pts0_batch)
         if len(bin_indices) >= 4:
             pts0_ransac = pts0_batch[bin_indices]
             pts1_ransac = pts1_batch[bin_indices]
             H_est, inliers = cv2.findHomography(pts0_ransac, pts1_ransac, cv2.RANSAC, ransac_thr)
-            denom_inliers = len(pts0_ransac)
+            # 注意：denom_inliers 保持为 len(pts0_batch)，不是 len(pts0_ransac)
         else:
             H_est, inliers = cv2.findHomography(pts0_batch, pts1_batch, cv2.RANSAC, ransac_thr)
-            denom_inliers = len(pts0_batch)
         
         # --- Failed 判定（严格对齐 0304 原则）---
         is_failed = False

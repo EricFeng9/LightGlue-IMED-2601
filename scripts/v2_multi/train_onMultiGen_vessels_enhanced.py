@@ -302,19 +302,19 @@ class MultimodalDataModule(pl.LightningDataModule):
             # 验证集：合并三个真实数据集的测试集
             # 1) CFFA 测试集
             cffa_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='val', mode='cf2fa')
+            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='test', mode='cf2fa')
             cffa_dataset = RealDatasetWrapper(cffa_base, split_name='test', dataset_name='CFFA')
             logger.info(f"验证集加载 CFFA 测试集: {len(cffa_dataset)} 样本")
             
             # 2) CFOCT 测试集
             cfoct_dir = script_dir / 'data' / 'operation_pre_filtered_cfoct'
-            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='val', mode='cf2oct')
+            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='test', mode='cf2oct')
             cfoct_dataset = RealDatasetWrapper(cfoct_base, split_name='test', dataset_name='CFOCT')
             logger.info(f"验证集加载 CFOCT 测试集: {len(cfoct_dataset)} 样本")
             
             # 3) OCTFA 测试集
             octfa_dir = script_dir / 'data' / 'operation_pre_filtered_octfa'
-            octfa_base = OCTFADataset(root_dir=str(octfa_dir), split='val', mode='fa2oct')
+            octfa_base = OCTFADataset(root_dir=str(octfa_dir), split='test', mode='fa2oct')
             octfa_dataset = RealDatasetWrapper(octfa_base, split_name='test', dataset_name='OCTFA')
             logger.info(f"验证集加载 OCTFA 测试集: {len(octfa_dataset)} 样本")
             
@@ -695,7 +695,7 @@ class MultimodalValidationCallback(Callback):
                     sample_dataset = dataset_names[i] if isinstance(dataset_names, list) else dataset_names
                     
                     # 只可视化 test split
-                    if sample_split == 'test':
+                    if sample_split in ('test', 'val'):
                         cur_count = per_dataset_counts.get(sample_dataset, 0)
                         if cur_count < max_per_dataset:
                             self._process_batch_sample(

@@ -205,9 +205,9 @@ class MultimodalDataModule(pl.LightningDataModule):
                 self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
                 logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFOCT)")
 
-                # 验证集（统一使用 val）
-                val_base = CFOCTDataset(root_dir=str(data_dir), split='val', mode='cf2oct')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='val')
+                # 验证集（使用测试集）
+                val_base = CFOCTDataset(root_dir=str(data_dir), split='test', mode='cf2oct')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
                 logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (CFOCT)")
             elif self.args.mode == 'octfa':
                 # OCTFA 模式: OCT 为 fix, FA 为 moving
@@ -218,9 +218,9 @@ class MultimodalDataModule(pl.LightningDataModule):
                 self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
                 logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (OCTFA)")
 
-                # 验证集（统一使用 val）
-                val_base = OCTFADataset(root_dir=str(data_dir), split='val', mode='fa2oct')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='val')
+                # 验证集（使用测试集）
+                val_base = OCTFADataset(root_dir=str(data_dir), split='test', mode='fa2oct')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
                 logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (OCTFA)")
             else:
                 # CFFA 模式 (默认): CF 为 fix, FA 为 moving
@@ -231,9 +231,9 @@ class MultimodalDataModule(pl.LightningDataModule):
                 self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
                 logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFFA)")
 
-                # 验证集（统一使用 val）
-                val_base = CFFADataset(root_dir=str(data_dir), split='val', mode='cf2fa')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='val')
+                # 验证集（使用测试集）
+                val_base = CFFADataset(root_dir=str(data_dir), split='test', mode='cf2fa')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
                 logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (CFFA)")
 
     def train_dataloader(self):
@@ -509,7 +509,7 @@ class MultimodalValidationCallback(Callback):
         pl_module.eval()
         
         visualized_count = 0
-        max_visualize = 20  # 最多可视化 20 个测试集样本
+        max_visualize = 20  # 最多可视化 20 个验证/测试集样本
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_dataloader):
@@ -523,8 +523,8 @@ class MultimodalValidationCallback(Callback):
                 for i in range(batch_size):
                     sample_split = splits[i] if isinstance(splits, list) else splits
                     
-                    # 只可视化 test split
-                    if sample_split == 'test':
+                    # 验证集只有 val split，可视化 val（若以后有 test 也一并可视化）
+                    if sample_split in ('test', 'val'):
                         self._process_batch_sample(trainer, pl_module, batch, outputs, target_dir, i, batch_idx, sample_split)
                         visualized_count += 1
                         
@@ -534,7 +534,7 @@ class MultimodalValidationCallback(Callback):
                 if visualized_count >= max_visualize:
                     break
         
-        logger.info(f"已可视化 {visualized_count} 个测试集样本")
+        logger.info(f"已可视化 {visualized_count} 个验证/测试集样本")
         pl_module.force_viz = False
 
     def _process_batch_sample(self, trainer, pl_module, batch, outputs, epoch_dir, sample_idx, batch_idx, split):
