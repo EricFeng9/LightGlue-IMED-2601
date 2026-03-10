@@ -261,10 +261,22 @@ class OCTFADataset(Dataset):
         return fix_tensor, moving_original_tensor, moving_gt_tensor, fix_path, moving_path, torch.from_numpy(T_0to1)
 
     def get_raw_sample(self, idx):
-        """返回未配准、未裁剪的原始数据及其关键点"""
+        """
+        返回未配准、未裁剪的原始数据及其关键点
+
+        返回格式（必须与 __getitem__ 一致）:
+        - img_fix: 固定图原始图像 (numpy array, H x W)
+        - img_moving: 移动图原始图像 (numpy array, H x W)
+        - fix_points: 固定图上的GT关键点 (numpy array, N x 2)
+        - moving_points: 移动图上的GT关键点 (numpy array, N x 2)
+        - fix_path: 固定图路径
+        - moving_path: 移动图路径
+        """
         sample = self.samples[idx]
-        fa_path, oct_path = sample['fa_path'], sample['oct_path']
-        fa_pts_path, oct_pts_path = sample['fa_pts'], sample['oct_pts']
+        fa_path = sample['fa_path']
+        oct_path = sample['oct_path']
+        fa_pts_path = sample['fa_pts']
+        oct_pts_path = sample['oct_pts']
 
         img_fa = cv2.imread(fa_path, cv2.IMREAD_GRAYSCALE)
         img_oct = cv2.imread(oct_path, cv2.IMREAD_GRAYSCALE)
@@ -272,7 +284,24 @@ class OCTFADataset(Dataset):
         fa_pts = read_points_from_txt(fa_pts_path)
         oct_pts = read_points_from_txt(oct_pts_path)
 
+        # 根据 mode 确定 fix/moving 对应关系
+        # mode='fa2oct': fix=OCT (01), moving=FA (02)
+        # mode='oct2fa': fix=FA (02), moving=OCT (01)
         if self.mode == 'fa2oct':
-            return img_fa, img_oct, fa_pts, oct_pts, fa_path, oct_path
-        else: # oct2fa
-            return img_oct, img_fa, oct_pts, fa_pts, oct_path, fa_path
+            # fix = OCT, moving = FA
+            img_fix = img_oct
+            img_moving = img_fa
+            fix_points = oct_pts
+            moving_points = fa_pts
+            fix_path = oct_path
+            moving_path = fa_path
+        else:  # oct2fa
+            # fix = FA, moving = OCT
+            img_fix = img_fa
+            img_moving = img_oct
+            fix_points = fa_pts
+            moving_points = oct_pts
+            fix_path = fa_path
+            moving_path = oct_path
+
+        return img_fix, img_moving, fix_points, moving_points, fix_path, moving_path

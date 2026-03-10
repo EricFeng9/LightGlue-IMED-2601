@@ -1,4 +1,6 @@
 """
+3-11:
+这个脚本是修改测试集前的脚本
 统一的测试脚本
 支持测试多种训练脚本的权重:
 - train_onGen.py (gen_cffa, gen_cfoct, gen_octfa, gen_mixed)
@@ -35,8 +37,8 @@ from scripts.v2_multi.metrics import (
 )
 
 # 导入真实数据集
-from data.CFFA.cffa_dataset import CFFADataset
-from data.CF_OCT.cf_oct_dataset import CFOCTDataset
+from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
+from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 from data.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
 
@@ -186,17 +188,17 @@ class TestDataModule:
         val_dataset_list = []
 
         if datasets is None or 'CFFA' in datasets:
-            cffa_dir = script_dir / 'data' / 'CFFA'
-            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='all', mode='cf2fa')
+            cffa_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
+            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='val', mode='cf2fa')
             cffa_dataset = RealDatasetWrapper(cffa_base, split_name='test', dataset_name='CFFA')
-            logger.info(f"加载 CFFA 测试集 (全部数据): {len(cffa_dataset)} 样本")
+            logger.info(f"加载 CFFA 测试集: {len(cffa_dataset)} 样本")
             val_dataset_list.append(cffa_dataset)
 
         if datasets is None or 'CFOCT' in datasets:
-            cfoct_dir = script_dir / 'data' / 'CF_OCT'
-            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='all', mode='oct2fa')
+            cfoct_dir = script_dir / 'data' / 'operation_pre_filtered_cfoct'
+            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='val', mode='cf2oct')
             cfoct_dataset = RealDatasetWrapper(cfoct_base, split_name='test', dataset_name='CFOCT')
-            logger.info(f"加载 CFOCT 测试集 (全部数据): {len(cfoct_dataset)} 样本")
+            logger.info(f"加载 CFOCT 测试集: {len(cfoct_dataset)} 样本")
             val_dataset_list.append(cfoct_dataset)
 
         if datasets is None or 'OCTFA' in datasets:

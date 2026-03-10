@@ -220,12 +220,56 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
         self.split_name = split_name
         # 标记来自哪个真实数据集（CFFA / CFOCT / OCTFA）
         self.dataset_name = dataset_name
+        self.target_size = 512
         
     def __len__(self):
         return len(self.base_dataset)
     
     def __getitem__(self, idx):
         fix_tensor, moving_original_tensor, moving_gt_tensor, fix_path, moving_path, T_0to1 = self.base_dataset[idx]
+        
+        # 获取原始样本（包含GT关键点）
+        fix_points = np.array([], dtype=np.float32).reshape(0, 2)
+        moving_points = np.array([], dtype=np.float32).reshape(0, 2)
+        
+        if hasattr(self.base_dataset, 'get_raw_sample'):
+            try:
+                raw_sample = self.base_dataset.get_raw_sample(idx)
+                fix_points = raw_sample[2] if raw_sample[2] is not None else np.array([], dtype=np.float32).reshape(0, 2)
+                moving_points = raw_sample[3] if raw_sample[3] is not None else np.array([], dtype=np.float32).reshape(0, 2)
+                
+                img_fix = raw_sample[0]
+                img_moving = raw_sample[1]
+                
+                if len(img_fix.shape) == 3:
+                    h_fix, w_fix = img_fix.shape[:2]
+                else:
+                    h_fix, w_fix = img_fix.shape
+                if len(img_moving.shape) == 3:
+                    h_mov, w_mov = img_moving.shape[:2]
+                else:
+                    h_mov, w_mov = img_moving.shape
+                
+                scale_x_fix = self.target_size / float(w_fix)
+                scale_y_fix = self.target_size / float(h_fix)
+                scale_x_mov = self.target_size / float(w_mov)
+                scale_y_mov = self.target_size / float(h_mov)
+                
+                if len(fix_points) > 0:
+                    fix_points = fix_points.copy()
+                    fix_points[:, 0] *= scale_x_fix
+                    fix_points[:, 1] *= scale_y_fix
+                if len(moving_points) > 0:
+                    moving_points = moving_points.copy()
+                    moving_points[:, 0] *= scale_x_mov
+                    moving_points[:, 1] *= scale_y_mov
+            except Exception as e:
+                fix_points = np.array([], dtype=np.float32).reshape(0, 2)
+                moving_points = np.array([], dtype=np.float32).reshape(0, 2)
+        
+        fix_points_tensor = torch.from_numpy(fix_points).float() if len(fix_points) > 0 else torch.zeros(0, 2, dtype=torch.float32)
+        moving_points_tensor = torch.from_numpy(moving_points).float() if len(moving_points) > 0 else torch.zeros(0, 2, dtype=torch.float32)
+        
         # 数据集返回的已是归一化到 [0, 1] 的 fix，和 [-1, 1] 的 moving
         moving_original_tensor = (moving_original_tensor + 1) / 2
         moving_gt_tensor = (moving_gt_tensor + 1) / 2
@@ -267,7 +311,9 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
             'T_0to1': T_fix_to_moving,
             'pair_names': (fix_name, moving_name),
             'dataset_name': self.dataset_name,
-            'split': self.split_name  # 添加 split 信息
+            'split': self.split_name,
+            'gt_pts0': fix_points_tensor,
+            'gt_pts1': moving_points_tensor,
         }
 
 class MultimodalDataModule(pl.LightningDataModule):

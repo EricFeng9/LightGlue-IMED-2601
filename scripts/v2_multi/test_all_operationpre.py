@@ -83,12 +83,56 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
         self.base_dataset = base_dataset
         self.split_name = split_name
         self.dataset_name = dataset_name
+        # 目标图像大小（与数据预处理一致）
+        self.target_size = 512
 
     def __len__(self):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
         fix_tensor, moving_original_tensor, moving_gt_tensor, fix_path, moving_path, T_0to1 = self.base_dataset[idx]
+
+        # 获取原始样本（包含GT关键点）
+        try:
+            if hasattr(self.base_dataset, 'get_raw_sample'):
+                raw_sample = self.base_dataset.get_raw_sample(idx)
+                # raw_sample[2] 是 fix 图像的关键点，raw_sample[3] 是 moving 图像的关键点
+                fix_points = raw_sample[2]  # (N, 2) 关键点坐标
+                moving_points = raw_sample[3]  # (N, 2) 关键点坐标
+
+                # 缩放关键点坐标到目标图像大小
+                img_fix = raw_sample[0]
+                img_moving = raw_sample[1]
+                if len(img_fix.shape) == 3:
+                    h_fix, w_fix = img_fix.shape[:2]
+                else:
+                    h_fix, w_fix = img_fix.shape
+                if len(img_moving.shape) == 3:
+                    h_mov, w_mov = img_moving.shape[:2]
+                else:
+                    h_mov, w_mov = img_moving.shape
+
+                # 缩放关键点到目标尺寸
+                scale_x_fix = self.target_size / float(w_fix)
+                scale_y_fix = self.target_size / float(h_fix)
+                scale_x_mov = self.target_size / float(w_mov)
+                scale_y_mov = self.target_size / float(h_mov)
+
+                if len(fix_points) > 0:
+                    fix_points = fix_points.copy()
+                    fix_points[:, 0] *= scale_x_fix
+                    fix_points[:, 1] *= scale_y_fix
+                if len(moving_points) > 0:
+                    moving_points = moving_points.copy()
+                    moving_points[:, 0] *= scale_x_mov
+                    moving_points[:, 1] *= scale_y_mov
+            else:
+                fix_points = np.array([], dtype=np.float32).reshape(0, 2)
+                moving_points = np.array([], dtype=np.float32).reshape(0, 2)
+        except Exception:
+            fix_points = np.array([], dtype=np.float32).reshape(0, 2)
+            moving_points = np.array([], dtype=np.float32).reshape(0, 2)
+
         moving_original_tensor = (moving_original_tensor + 1) / 2
         moving_gt_tensor = (moving_gt_tensor + 1) / 2
 
@@ -107,6 +151,10 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
         except Exception:
             T_fix_to_moving = T_0to1
 
+        # 转换 numpy 关键点为 torch tensor
+        fix_points_tensor = torch.from_numpy(fix_points).float() if len(fix_points) > 0 else torch.zeros(0, 2)
+        moving_points_tensor = torch.from_numpy(moving_points).float() if len(moving_points) > 0 else torch.zeros(0, 2)
+
         return {
             'image0': fix_gray,
             'image1': moving_orig_gray,
@@ -114,7 +162,9 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
             'T_0to1': T_fix_to_moving,
             'pair_names': (os.path.basename(fix_path), os.path.basename(moving_path)),
             'dataset_name': self.dataset_name,
-            'split': self.split_name
+            'split': self.split_name,
+            'gt_pts0': fix_points_tensor,  # GT关键点（固定图，已缩放到512x512）
+            'gt_pts1': moving_points_tensor,  # GT关键点（移动图，已缩放到512x512）
         }
 
 
@@ -132,9 +182,10 @@ def build_full_dataset(dataset_cls, root_dir, mode, dataset_name):
 def build_all_dataloaders(args):
     """返回 {dataset_name: DataLoader} 字典，每个数据集独立一个 DataLoader"""
     script_dir = Path(__file__).parent.parent.parent
+
     loader_params = {
         'batch_size': args.batch_size,
-        'num_workers': args.num_workers,
+
         'pin_memory': True,
         'shuffle': False,
     }
@@ -227,6 +278,14 @@ class UnifiedEvaluator:
                 mkpts1_f_list.append(torch.from_numpy(pts1).float())
                 m_bids_list.append(torch.full((len(pts0),), b, dtype=torch.long))
 
+        # 获取 GT 关键点（每个样本一个）
+        gt_pts0_list = []
+        gt_pts1_list = []
+        if 'gt_pts0' in batch and 'gt_pts1' in batch:
+            for b in range(B):
+                gt_pts0_list.append(batch['gt_pts0'][b])
+                gt_pts1_list.append(batch['gt_pts1'][b])
+
         metrics_batch = {
             'mkpts0_f': torch.cat(mkpts0_f_list, dim=0) if mkpts0_f_list else torch.empty(0, 2),
             'mkpts1_f': torch.cat(mkpts1_f_list, dim=0) if mkpts1_f_list else torch.empty(0, 2),
@@ -234,6 +293,8 @@ class UnifiedEvaluator:
             'T_0to1': batch['T_0to1'],
             'image0': batch['image0'],
             'dataset_name': batch['dataset_name'],
+            'gt_pts0': gt_pts0_list,  # List of tensors, 每个元素 (N, 2)
+            'gt_pts1': gt_pts1_list,  # List of tensors, 每个元素 (N, 2)
         }
 
         compute_homography_errors(metrics_batch, self.config if self.config else pl_module.config)
@@ -597,6 +658,9 @@ def save_comparison_csv(output_dir, trained_results, baseline_results=None):
     with open(csv_path, "w", newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
 
+        # 在 CSV 头部添加元数据注释
+        writer.writerow([f"# Generated by test_all_operationpre.py"])
+
         if baseline_results is not None:
             writer.writerow(['Dataset', 'Metric', 'Trained (MultiGen)', 'Baseline (Pretrained)'])
         else:
@@ -704,9 +768,9 @@ def parse_args():
     parser.add_argument('--baseline', action='store_true',
                         help='额外运行 LightGlue 原生预训练权重作为 baseline 并输出对比表格')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
-    parser.add_argument('--num_workers', type=int, default=8, help='数据加载线程数')
     parser.add_argument('--gpus', type=str, default='0', help='GPU设备ID')
     parser.add_argument('--no_viz', action='store_true', help='禁用可视化')
+
     return parser.parse_args()
 
 
@@ -753,7 +817,6 @@ def main():
     module = importlib.import_module('scripts.v2_multi.train_onMultiGen_vessels_enhanced')
     get_default_config = getattr(module, 'get_default_config')
     config = get_default_config()
-    pl.seed_everything(config.TRAINER.SEED)
     config.TRAINER.WORLD_SIZE = len(gpus_list)
     config.TRAINER.TRUE_BATCH_SIZE = len(gpus_list) * args.batch_size
 

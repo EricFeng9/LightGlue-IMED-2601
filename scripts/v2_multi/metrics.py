@@ -291,19 +291,55 @@ def _reprojection_stats(H, pts0, pts1):
     return mse, avg_dist, dis
 
 
+def _reprojection_stats_gt(H, gt_pts0, gt_pts1):
+    """
+    基于 GT 关键点计算重投影误差（用于评估指标）
+
+    - MSE: GT关键点坐标 MSE = mean((gt_pts1 - pts1_pred)^2)
+    - avg_dist: GT关键点平均重投影误差（L2）
+    - dis: 每个GT关键点的重投影误差
+
+    参数:
+        H: 估计的单应矩阵 (3x3)
+        gt_pts0: GT关键点（固定图上的点）(N, 2)
+        gt_pts1: GT关键点（移动图上的点，配对的）(N, 2)
+
+    返回:
+        mse, avg_dist, dis
+    """
+    if H is None or len(gt_pts0) == 0:
+        return float('inf'), float('inf'), None
+
+    # 将 gt_pts0 投影到移动图空间
+    gt_pts0_homo = gt_pts0.reshape(-1, 1, 2).astype(np.float32)
+    try:
+        gt_pts1_pred = cv2.perspectiveTransform(gt_pts0_homo, H).reshape(-1, 2)
+    except Exception:
+        return float('inf'), float('inf'), None
+
+    # 计算投影点与GT关键点之间的误差
+    diff = (gt_pts1 - gt_pts1_pred).astype(np.float64)
+    mse = float(np.mean(diff ** 2))
+    dis = np.sqrt(diff[:, 0] ** 2 + diff[:, 1] ** 2)
+    avg_dist = float(dis.mean()) if len(dis) > 0 else float('inf')
+    return mse, avg_dist, dis
+
+
 def compute_homography_errors(data, config):
     """
     严格对齐 scripts/v2/metrics_cau_principle_0305.md 的指标口径：
     - Failed: num_matches<4 或 inliers_rate<1e-6 或 H≈I (atol=1e-3) 或 H_est None
-    - AUC: 使用 mace（角点误差，失败样本写入 1e6；成功样本包括 inaccurate 也写入 mace）
-    - Inaccurate: mae>50 或 mee>20（基于 dis = L2(pts1-pts1_pred)）
-    - MSE/MACE: 仅 Acceptable（成功且非 inaccurate），否则置 inf，最终聚合时过滤
+    - AUC: 使用 gt_mace（基于GT关键点的误差，失败样本写入 1e6；成功样本包括 inaccurate 也写入 gt_mace）
+    - Inaccurate: mae>50 或 mee>20（基于 dis = L2(pts1-pts1_pred)，使用GT关键点）
+    - MSE/GT_MACE: 仅 Acceptable（成功且非 inaccurate），否则置 inf，最终聚合时过滤
+
+    使用 GT 关键点计算指标（而非角点或模型匹配点）
 
     Update:
         data (dict): 会写入
             - "H_est": List[np.ndarray] length B
             - "inliers": List[np.ndarray] length B (bool mask for RANSAC points)
-            - "t_errs": List[float] length B (用于 AUC 的 error = mace 或 1e6)
+            - "t_errs": List[float] length B (用于 AUC 的 error = gt_mace 或 1e6)
             - "mse_list": List[float] length B (Acceptable 才为有限值)
             - "mace_list": List[float] length B (Acceptable 才为有限值)
             - "failed_mask": List[bool] length B
@@ -319,7 +355,7 @@ def compute_homography_errors(data, config):
         'failed_mask': [],
         'inaccurate_mask': [],
     })
-    
+
     m_bids = data['m_bids'].cpu().numpy()
     pts0 = data['mkpts0_f'].cpu().numpy()
     pts1 = data['mkpts1_f'].cpu().numpy()
@@ -327,11 +363,15 @@ def compute_homography_errors(data, config):
     mconf = data.get('mconf')
     if mconf is not None:
         mconf = mconf.cpu().numpy()
-    
+
+    # 获取 GT 关键点（如果存在）
+    gt_pts0_batch = data.get('gt_pts0', None)  # List of np.ndarray, 每个元素 (N, 2)
+    gt_pts1_batch = data.get('gt_pts1', None)  # List of np.ndarray, 每个元素 (N, 2)
+
     for bs in range(H_gt.shape[0]):
         mask = m_bids == bs
         num_matches = np.sum(mask)
-        
+
         if num_matches < 4:
             _dual_log("WARNING", f"⚠️ Batch {bs}: 匹配点数不足 ({num_matches} < 4)")
             data['R_errs'].append(0.0)
@@ -343,18 +383,18 @@ def compute_homography_errors(data, config):
             data['failed_mask'].append(True)
             data['inaccurate_mask'].append(False)
             continue
-            
+
         # 估计单应矩阵 (对应 plan.md 第四阶段: 几何估计)
         # 【方案 B 改进】进行空间均匀化 (Spatial Binning)
         img_size = data['image0'].shape[2:]
         pts0_batch = pts0[mask]
         pts1_batch = pts1[mask]
         mconf_batch = mconf[mask] if mconf is not None else None
-        
+
         bin_indices = spatial_binning(pts0_batch, pts1_batch, img_size, grid_size=4, top_n=20, conf=mconf_batch)
-        
+
         _dual_log("INFO", f"🔍 Batch {bs}: 总匹配点={num_matches}, Spatial Binning后={len(bin_indices)}")
-        
+
         ransac_thr = float(getattr(getattr(config, 'TRAINER', object()), 'RANSAC_PIXEL_THR', 3.0))
         # 【修复】inliers_rate 分母必须使用全部匹配点数
         denom_inliers = len(pts0_batch)
@@ -365,7 +405,7 @@ def compute_homography_errors(data, config):
             # 注意：denom_inliers 保持为 len(pts0_batch)，不是 len(pts0_ransac)
         else:
             H_est, inliers = cv2.findHomography(pts0_batch, pts1_batch, cv2.RANSAC, ransac_thr)
-        
+
         # --- Failed 判定（严格对齐 0304 原则）---
         is_failed = False
         if H_est is None or (isinstance(H_est, np.ndarray) and (np.isnan(H_est).any() or np.isinf(H_est).any())):
@@ -401,8 +441,35 @@ def compute_homography_errors(data, config):
             data['inaccurate_mask'].append(False)
             continue
 
-        # --- 成功样本：计算 avg_dist / MSE / Inaccurate / MACE ---
-        mse, avg_dist, dis = _reprojection_stats(H_est, pts0_batch, pts1_batch)
+        # --- 成功样本：使用 GT 关键点计算误差 ---
+        # 获取本样本的 GT 关键点
+        if gt_pts0_batch is None or gt_pts1_batch is None:
+            raise ValueError(f"Batch {bs}: 缺少GT关键点数据 (gt_pts0或gt_pts1为None)")
+
+        # 如果 gt_pts0_batch 是 list，每个元素对应一个 batch
+        if isinstance(gt_pts0_batch, list):
+            gt_pts0 = gt_pts0_batch[bs] if bs < len(gt_pts0_batch) else None
+            gt_pts1 = gt_pts1_batch[bs] if bs < len(gt_pts1_batch) else None
+        else:
+            raise ValueError(f"Batch {bs}: GT关键点格式错误，应为list而非tensor")
+
+        # 检查GT关键点是否存在
+        if gt_pts0 is None or gt_pts1 is None:
+            raise ValueError(f"Batch {bs}: GT关键点为None")
+
+        # 确保是numpy数组
+        if isinstance(gt_pts0, torch.Tensor):
+            gt_pts0 = gt_pts0.cpu().numpy()
+        if isinstance(gt_pts1, torch.Tensor):
+            gt_pts1 = gt_pts1.cpu().numpy()
+
+        # 检查GT关键点数量是否足够
+        if len(gt_pts0) < 4 or len(gt_pts1) < 4:
+            raise ValueError(f"Batch {bs}: GT关键点数量不足 (fix:{len(gt_pts0)}, moving:{len(gt_pts1)})，需要至少4个关键点")
+
+        # 使用 GT 关键点计算重投影误差
+        mse, avg_dist, dis = _reprojection_stats_gt(H_est, gt_pts0, gt_pts1)
+
         if dis is None or not np.isfinite(avg_dist):
             # 极端数值问题，按失败处理
             _dual_log("WARNING", f"⚠️ Batch {bs}: 重投影误差异常，按失败处理")
@@ -423,17 +490,17 @@ def compute_homography_errors(data, config):
         if is_inaccurate:
             _dual_log("WARNING", f"⚠️ Batch {bs}: Inaccurate (mae={mae:.2f}, mee={mee:.2f})")
 
-        h, w = data['image0'].shape[2:]
-        mace = compute_corner_error(H_est, H_gt[bs], height=h, width=w)
+        # GT-MACE = GT关键点的平均重投影误差
+        gt_mace = float(np.mean(dis)) if len(dis) > 0 else float('inf')
 
         # 处理极端 mace 值（数值问题时用大值替代）
-        if not np.isfinite(mace):
-            _dual_log("WARNING", f"⚠️ Batch {bs}: mace 数值异常 ({mace})，用 1e6 替代")
-            mace = 1e6
+        if not np.isfinite(gt_mace):
+            _dual_log("WARNING", f"⚠️ Batch {bs}: gt_mace 数值异常 ({gt_mace})，用 1e6 替代")
+            gt_mace = 1e6
 
-        # AUC: 成功样本（含 inaccurate）使用 mace（角点误差，避免自拟合欺骗）
+        # AUC: 成功样本（含 inaccurate）使用 gt_mace（基于GT关键点的误差）
         data['R_errs'].append(0.0)
-        data['t_errs'].append(mace)
+        data['t_errs'].append(gt_mace)
         data['inliers'].append(inliers.ravel() > 0 if inliers is not None else np.array([]).astype(bool))
         data['H_est'].append(H_est)
 
@@ -443,7 +510,7 @@ def compute_homography_errors(data, config):
             data['mace_list'].append(np.inf)
         else:
             data['mse_list'].append(mse)
-            data['mace_list'].append(mace)
+            data['mace_list'].append(gt_mace)
 
         data['failed_mask'].append(False)
         data['inaccurate_mask'].append(bool(is_inaccurate))
