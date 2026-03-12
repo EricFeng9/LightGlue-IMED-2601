@@ -20,6 +20,11 @@ import pytorch_lightning as pl
 from torch.utils.data import ConcatDataset, DataLoader
 import csv
 
+# matplotlib 导入（用于 T_0to1_check 可视化）
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 # 添加父目录到 sys.path
 # 先添加项目根目录，以便导入 dataset 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
@@ -550,6 +555,37 @@ def _visualize_batch(batch, outputs, output_dir, batch_idx, sample_counter=0):
         except:
             pass
 
+        # 输出 T_0to1 验证图（根据 dataset_principle.md 第五节要求）
+        try:
+            # batch 中的 T_0to1 已经是 fix→moving（Wrapper 取了逆）
+            # 需要再取逆回 moving→fix 才能用于验证
+            T_mov2fix = np.linalg.inv(batch['T_0to1'][sample_idx].cpu().numpy())
+            
+            # 获取 GT 关键点
+            gt_pts0_batch = batch.get('gt_pts0', None)
+            gt_pts1_batch = batch.get('gt_pts1', None)
+            
+            if gt_pts0_batch is not None and gt_pts1_batch is not None:
+                gt_pts0 = gt_pts0_batch[sample_idx] if isinstance(gt_pts0_batch, list) else gt_pts0_batch[sample_idx]
+                gt_pts1 = gt_pts1_batch[sample_idx] if isinstance(gt_pts1_batch, list) else gt_pts1_batch[sample_idx]
+                
+                if isinstance(gt_pts0, torch.Tensor):
+                    gt_pts0 = gt_pts0.cpu().numpy()
+                if isinstance(gt_pts1, torch.Tensor):
+                    gt_pts1 = gt_pts1.cpu().numpy()
+                
+                if len(gt_pts0) > 0 and len(gt_pts1) > 0:
+                    visualize_T_0to1_check(
+                        fix_img=img0,
+                        moving_img=img1,
+                        gt_pts0=gt_pts0,
+                        gt_pts1=gt_pts1,
+                        T_0to1_mov2fix=T_mov2fix,
+                        save_path=str(save_path / 'T_0to1_check.png')
+                    )
+        except Exception as e:
+            logger.warning(f"T_0to1 验证图生成失败: {e}")
+
         if 'mses' in outputs and sample_idx < len(outputs['mses']):
             mse = outputs['mses'][sample_idx]
             mace = outputs['maces'][sample_idx]
@@ -581,6 +617,67 @@ def create_chessboard(img1, img2, grid_size=4):
             else:
                 chessboard[y_start:y_end, x_start:x_end] = img2[y_start:y_end, x_start:x_end]
     return chessboard
+
+
+def visualize_T_0to1_check(fix_img, moving_img, gt_pts0, gt_pts1, T_0to1_mov2fix, save_path):
+    """
+    可视化 T_0to1 变换矩阵的正确性验证。
+    
+    根据 dataset_principle.md 第五节要求，必须输出此验证图。
+    
+    Args:
+        fix_img:    numpy [H, W], uint8, fix 图像 (512x512)
+        moving_img: numpy [H, W], uint8, moving 图像 (512x512)
+        gt_pts0:    numpy [N, 2], fix 图上的 GT 关键点 (512 空间)
+        gt_pts1:    numpy [N, 2], moving 图上的 GT 关键点 (512 空间)
+        T_0to1_mov2fix: numpy [3, 3], moving → fix 变换矩阵 (512 空间)
+                        即数据集 __getitem__ 直接返回的 T_0to1
+        save_path:  str, 保存路径
+    """
+    if len(gt_pts0) == 0 or len(gt_pts1) == 0:
+        return
+    
+    N = min(len(gt_pts0), len(gt_pts1))
+    pts1 = gt_pts1[:N]  # moving 上的 GT 关键点
+    pts0 = gt_pts0[:N]  # fix 上的 GT 关键点
+    
+    # 用 T_0to1 (moving→fix) 将 moving 关键点投影到 fix 空间
+    pts1_h = np.concatenate([pts1, np.ones((N, 1))], axis=1)  # [N, 3]
+    pts1_proj = (T_0to1_mov2fix @ pts1_h.T).T  # [N, 3]
+    pts1_proj = pts1_proj[:, :2] / (pts1_proj[:, 2:] + 1e-8)  # [N, 2]
+    
+    # 计算投影误差
+    errors = np.sqrt(np.sum((pts1_proj - pts0) ** 2, axis=1))
+    mean_err = np.mean(errors)
+    max_err = np.max(errors)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # 左图: fix 图 + GT关键点(绿) + moving投影点(红)
+    axes[0].imshow(fix_img, cmap='gray')
+    axes[0].scatter(pts0[:, 0], pts0[:, 1], c='lime', s=30, marker='o', label='gt_pts0 (fix GT)', zorder=5)
+    axes[0].scatter(pts1_proj[:, 0], pts1_proj[:, 1], c='red', s=30, marker='x', label='gt_pts1 projected', zorder=5)
+    axes[0].set_title(f'Fix image\nmean_err={mean_err:.2f}px, max_err={max_err:.2f}px')
+    axes[0].legend(fontsize=8)
+    
+    # 中图: moving 图 + GT关键点(绿)
+    axes[1].imshow(moving_img, cmap='gray')
+    axes[1].scatter(pts1[:, 0], pts1[:, 1], c='lime', s=30, marker='o', label='gt_pts1 (moving GT)', zorder=5)
+    axes[1].set_title('Moving image')
+    axes[1].legend(fontsize=8)
+    
+    # 右图: 逐点误差柱状图
+    axes[2].bar(range(N), errors, color='steelblue')
+    axes[2].axhline(y=mean_err, color='red', linestyle='--', label=f'mean={mean_err:.2f}px')
+    axes[2].set_xlabel('Keypoint index')
+    axes[2].set_ylabel('Projection error (px)')
+    axes[2].set_title('Per-point projection error')
+    axes[2].legend(fontsize=8)
+    
+    plt.suptitle('T_0to1 Verification (moving→fix projection)', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)
 
 
 def get_train_script_config(train_script):
