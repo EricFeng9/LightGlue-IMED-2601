@@ -20,6 +20,10 @@ import pytorch_lightning as pl
 from torch.utils.data import ConcatDataset, DataLoader
 import csv
 
+# 添加父目录到 sys.path
+# 先添加项目根目录，以便导入 dataset 模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
+# 再添加 LightGlue 目录，以便导入 lightglue 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from lightglue import LightGlue
@@ -33,9 +37,9 @@ from scripts.v2_multi.metrics import (
     compute_auc_rop
 )
 
-from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
-from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
-from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+from dataset.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
+from dataset.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
+from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
 
 # ---------------------------------------------------------------------------
@@ -185,18 +189,18 @@ def build_all_dataloaders(args):
 
     loader_params = {
         'batch_size': args.batch_size,
-
+        'num_workers': args.num_workers,
         'pin_memory': True,
         'shuffle': False,
     }
 
-    cffa_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-    cfoct_dir = script_dir / 'data' / 'operation_pre_filtered_cfoct'
-    octfa_dir = script_dir / 'data' / 'operation_pre_filtered_octfa'
+    cffa_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_cffa'
+    cfoct_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_cfoct'
+    octfa_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_octfa'
 
     datasets = {
-        'CFFA': build_full_dataset(CFFADataset, cffa_dir, 'cf2fa', 'CFFA'),
-        'CFOCT': build_full_dataset(CFOCTDataset, cfoct_dir, 'cf2oct', 'CFOCT'),
+        'CFFA': build_full_dataset(CFFADataset, cffa_dir, 'fa2cf', 'CFFA'),
+        'CFOCT': build_full_dataset(CFOCTDataset, cfoct_dir, 'oct2cf', 'CFOCT'),
         'OCTFA': build_full_dataset(OCTFADataset, octfa_dir, 'fa2oct', 'OCTFA'),
     }
 
@@ -768,6 +772,8 @@ def parse_args():
     parser.add_argument('--baseline', action='store_true',
                         help='额外运行 LightGlue 原生预训练权重作为 baseline 并输出对比表格')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
+    parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
+    parser.add_argument('--seed', type=int, default=None, help='随机种子（不指定则自动生成）')
     parser.add_argument('--gpus', type=str, default='0', help='GPU设备ID')
     parser.add_argument('--no_viz', action='store_true', help='禁用可视化')
 
@@ -776,6 +782,26 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # 设置随机种子（如果未指定则自动生成）
+    if args.seed is None:
+        import time
+        args.seed = int(time.time() * 1000) % (2**31)
+        logger.info(f"未指定 seed，自动生成: {args.seed}")
+    else:
+        if args.seed < 0 or args.seed >= 2**31:
+            logger.error(f"seed 必须在 [0, {2**31}) 范围内")
+            return
+        logger.info(f"使用指定 seed: {args.seed}")
+
+    # 设置所有随机种子
+    import random
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # 确定 checkpoint 路径
     if args.checkpoint:

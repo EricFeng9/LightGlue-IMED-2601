@@ -148,103 +148,9 @@ def random_domain_augment_image(image):
             img_tensor = img_tensor.unsqueeze(0).unsqueeze(0)
         elif img_tensor.ndim == 3:
             img_tensor = img_tensor.unsqueeze(0)
-            
-    # ------ 开始随机化 ------
     
-    # 【核心修复】：注释掉独立的 FOV 破坏，防止空间撕裂！
-    # B_tmp, C_tmp, H_tmp, W_tmp = img_tensor.shape
-    # device_tmp = img_tensor.device
-    # fov_mask = torch.zeros_like(img_tensor)
-    # center_jitter, radius_jitter = 0.08, 0.15
-    # for b in range(B_tmp):
-    #     cx = W_tmp / 2.0 + random.uniform(-center_jitter, center_jitter) * W_tmp
-    #     cy = H_tmp / 2.0 + random.uniform(-center_jitter, center_jitter) * H_tmp
-    #     r = min(H_tmp, W_tmp) / 2.0 * random.uniform(1.0 - radius_jitter, 1.0)
-    #     y_grid, x_grid = torch.meshgrid(torch.arange(H_tmp, device=device_tmp), torch.arange(W_tmp, device=device_tmp), indexing='ij')
-    #     dist = torch.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
-    #     edge_width = random.uniform(1.0, 10.0)
-    #     fov_mask[b] = torch.sigmoid((r - dist) / edge_width).unsqueeze(0)
-    
-    # 【立刻应用 FOV Mask】在所有颜色变换之前！
-    # img_tensor = img_tensor * fov_mask
-    
-    # 2. 图像反色 (所有通道取反) (25% 概率)
-    # 此时，如果反色，内部背景和外部背景会同步从 0 变成 1，不会产生边缘！
-    if random.random() < 0.25:
-        img_tensor = 1.0 - img_tensor
-    
-    # 3. 非线性 Gamma 变换 (50% 概率，模拟不同模态的非线性灰度映射)
-    if random.random() < 0.5:
-        B = img_tensor.shape[0]
-        gamma = random.uniform(0.5, 2.0)  # 对整个batch使用相同的gamma值
-        for b in range(B):
-            img_tensor[b] = torch.pow(img_tensor[b].clamp(1e-6, 1.0), gamma)
-        
-    # 4. 对比度剧烈随机调整 (0.6x - 1.5x，温和范围，避免图像完全变黑或过曝)
-    # 【关键修复】之前的 0.3-2.5 范围过于极端，会导致血管特征完全丢失
-    B = img_tensor.shape[0]
-    contrast = random.uniform(0.6, 1.5)  # 对整个batch使用相同的对比度值
-    for b in range(B):
-        mean_val = img_tensor[b].mean()
-        img_tensor[b] = (img_tensor[b] - mean_val) * contrast + mean_val
-    img_tensor = img_tensor.clamp(0, 1)
-    
-    # 5. 亮度随机偏移 (30% 概率，减小范围避免完全变黑)
-    if random.random() < 0.3:
-        brightness_shift = random.uniform(-0.1, 0.1)  # 从 ±0.2 降低到 ±0.1
-        img_tensor = (img_tensor + brightness_shift).clamp(0, 1)
-        
-    # 6. 水平/竖直独立的1-8倍下采样 (30% 概率触发下采样，提升触发率)
-    if random.random() < 0.3:
-        H, W = img_tensor.shape[2:]
-        # 水平方向独立随机：1到8倍下采样
-        h_scale = random.randint(1, 8)
-        # 竖直方向独立随机：1到8倍下采样
-        w_scale = random.randint(1, 8)
-        
-        low_res = F.interpolate(img_tensor, size=(max(1, H // h_scale), max(1, W // w_scale)), mode='bilinear', align_corners=False)
-        img_tensor = F.interpolate(low_res, size=(H, W), mode='bilinear', align_corners=False)
-        
-    # 7. 横竖黑色条纹 (10% 概率，数量不多 1-5 条)
-    if random.random() < 0.1:
-        img_tensor = apply_black_stripes_tensor(img_tensor, num_stripes_range=(1, 5), stripe_width_range=(1, 3))
-        
-    # 8. 不均匀高斯噪声 (模拟光照不均，产生暗区) - 局部暗斑，不是全局变暗
-    # 【关键修复】降低触发率和强度，避免过度遮挡血管
-    if random.random() < 0.5:  # 从 80% 降低到 50%
-        img_tensor = apply_nonuniform_gaussian_noise_tensor(img_tensor, noise_std_max=0.02, dark_spot_strength=0.15)
-        
-    # 9. 添加少量全局高斯噪声
-    if random.random() < 0.1:
-        noise_std = random.uniform(0.002, 0.008)  # 对整个batch使用相同的噪声强度
-        noise = torch.randn_like(img_tensor) * noise_std
-        img_tensor = (img_tensor + noise).clamp(0, 1)
-        
-    # 规约到合法区间
-    img_tensor = img_tensor.clamp(0, 1)
-    
-    # 【关键保护】动态范围保护：确保图像不会完全变黑或变白
-    # 如果图像动态范围过小（几乎全黑或全白），进行自适应拉伸
-    B = img_tensor.shape[0]
-    for b in range(B):
-        img_min = img_tensor[b].min()
-        img_max = img_tensor[b].max()
-        dynamic_range = img_max - img_min
-        
-        # 如果动态范围小于 0.15（说明图像几乎是纯色），进行拉伸
-        if dynamic_range < 0.15:
-            # 拉伸到 [0.05, 0.95] 范围，保留一定的对比度
-            img_tensor[b] = (img_tensor[b] - img_min) / (dynamic_range + 1e-6)
-            img_tensor[b] = img_tensor[b] * 0.9 + 0.05
-        # 如果动态范围太小但不至于全黑，进行温和拉伸
-        elif dynamic_range < 0.3:
-            img_tensor[b] = (img_tensor[b] - img_min) / (dynamic_range + 1e-6)
-            img_tensor[b] = img_tensor[b] * 0.8 + 0.1
-    
-    img_tensor = img_tensor.clamp(0, 1)
-    
-    # 【已删除】FOV Mask 已经在最开始应用，不需要在这里重复应用
-    # 原因：如果在这里应用，反色和亮度调整后会产生锐利的人工边缘，导致模型学习到错误的特征
+    # 调用内部函数，传入预生成的随机参数（如果需要）
+    img_tensor = _apply_domain_augmentation(img_tensor)
     
     # ------ 转换回原格式 ------
     if is_numpy:
@@ -257,3 +163,143 @@ def random_domain_augment_image(image):
         return img_np
     else:
         return img_tensor.view(original_shape)
+
+
+def random_domain_augment_pair(img0, img1):
+    """
+    对图像对 (fix, moving) 应用统一的域随机化增强。
+    确保两个图像使用相同的随机变换参数，以保持它们之间的几何对应关系。
+    
+    Args:
+        img0: 第一张图像 (numpy array 或 torch tensor), shape [H, W] 或 [1, H, W]
+        img1: 第二张图像 (numpy array 或 torch tensor), shape [H, W] 或 [1, H, W]
+    
+    Returns:
+        img0_aug, img1_aug: 增强后的图像对
+    """
+    is_numpy = isinstance(img0, np.ndarray)
+    
+    # 转换为 tensor [B=2, C=1, H, W]
+    if is_numpy:
+        img_dtype = img0.dtype
+        
+        def _to_tensor(img):
+            if img.ndim == 2:
+                return torch.from_numpy(img).unsqueeze(0).unsqueeze(0).float()
+            else:
+                return torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float()
+        
+        img0_tensor = _to_tensor(img0)
+        img1_tensor = _to_tensor(img1)
+        
+        if img0_tensor.max() > 2.0:
+            scale_factor = 255.0
+            img0_tensor = img0_tensor / 255.0
+            img1_tensor = img1_tensor / 255.0
+        else:
+            scale_factor = 1.0
+    else:
+        def _to_tensor(img):
+            img = img.clone().float()
+            if img.ndim == 2:
+                return img.unsqueeze(0).unsqueeze(0)
+            elif img.ndim == 3:
+                return img.unsqueeze(0)
+            return img
+        
+        img0_tensor = _to_tensor(img0)
+        img1_tensor = _to_tensor(img1)
+        scale_factor = 1.0
+    
+    # 合并为 batch，应用统一的随机化
+    img_pair = torch.cat([img0_tensor, img1_tensor], dim=0)  # [2, 1, H, W]
+    img_pair_aug = _apply_domain_augmentation(img_pair)
+    
+    # 分离回两个图像
+    img0_aug = img_pair_aug[0:1]
+    img1_aug = img_pair_aug[1:2]
+    
+    # 转换回原格式
+    if is_numpy:
+        def _to_numpy(tensor):
+            img_np = tensor.squeeze(0).permute(1, 2, 0).numpy()
+            if img0.ndim == 2:
+                img_np = img_np[:, :, 0]
+            if img_dtype == np.uint8:
+                img_np = img_np.clip(0, 255).astype(np.uint8)
+            return img_np
+        
+        return _to_numpy(img0_aug * scale_factor), _to_numpy(img1_aug * scale_factor)
+    else:
+        return img0_aug.squeeze(0), img1_aug.squeeze(0)
+
+
+def _apply_domain_augmentation(img_tensor):
+    """
+    内部函数: 对已经是 tensor 格式的图像应用域随机化
+    """
+    # 2. 图像反色 (所有通道取反) (25% 概率)
+    if random.random() < 0.25:
+        img_tensor = 1.0 - img_tensor
+    
+    # 3. 非线性 Gamma 变换 (50% 概率，模拟不同模态的非线性灰度映射)
+    if random.random() < 0.5:
+        B = img_tensor.shape[0]
+        gamma = random.uniform(0.5, 2.0)  # 对整个batch使用相同的gamma值
+        for b in range(B):
+            img_tensor[b] = torch.pow(img_tensor[b].clamp(1e-6, 1.0), gamma)
+        
+    # 4. 对比度剧烈随机调整 (0.6x - 1.5x，温和范围，避免图像完全变黑或过曝)
+    B = img_tensor.shape[0]
+    contrast = random.uniform(0.6, 1.5)  # 对整个batch使用相同的对比度值
+    for b in range(B):
+        mean_val = img_tensor[b].mean()
+        img_tensor[b] = (img_tensor[b] - mean_val) * contrast + mean_val
+    img_tensor = img_tensor.clamp(0, 1)
+    
+    # 5. 亮度随机偏移 (30% 概率，减小范围避免完全变黑)
+    if random.random() < 0.3:
+        brightness_shift = random.uniform(-0.1, 0.1)
+        img_tensor = (img_tensor + brightness_shift).clamp(0, 1)
+        
+    # 6. 水平/竖直独立的1-8倍下采样 (30% 概率触发下采样)
+    if random.random() < 0.3:
+        H, W = img_tensor.shape[2:]
+        h_scale = random.randint(1, 8)
+        w_scale = random.randint(1, 8)
+        
+        low_res = F.interpolate(img_tensor, size=(max(1, H // h_scale), max(1, W // w_scale)), mode='bilinear', align_corners=False)
+        img_tensor = F.interpolate(low_res, size=(H, W), mode='bilinear', align_corners=False)
+        
+    # 7. 横竖黑色条纹 (10% 概率)
+    if random.random() < 0.1:
+        img_tensor = apply_black_stripes_tensor(img_tensor, num_stripes_range=(1, 5), stripe_width_range=(1, 3))
+        
+    # 8. 不均匀高斯噪声 (50% 概率)
+    if random.random() < 0.5:
+        img_tensor = apply_nonuniform_gaussian_noise_tensor(img_tensor, noise_std_max=0.02, dark_spot_strength=0.15)
+        
+    # 9. 添加少量全局高斯噪声
+    if random.random() < 0.1:
+        noise_std = random.uniform(0.002, 0.008)
+        noise = torch.randn_like(img_tensor) * noise_std
+        img_tensor = (img_tensor + noise).clamp(0, 1)
+        
+    # 规约到合法区间
+    img_tensor = img_tensor.clamp(0, 1)
+    
+    # 动态范围保护
+    B = img_tensor.shape[0]
+    for b in range(B):
+        img_min = img_tensor[b].min()
+        img_max = img_tensor[b].max()
+        dynamic_range = img_max - img_min
+        
+        if dynamic_range < 0.15:
+            img_tensor[b] = (img_tensor[b] - img_min) / (dynamic_range + 1e-6)
+            img_tensor[b] = img_tensor[b] * 0.9 + 0.05
+        elif dynamic_range < 0.3:
+            img_tensor[b] = (img_tensor[b] - img_min) / (dynamic_range + 1e-6)
+            img_tensor[b] = img_tensor[b] * 0.8 + 0.1
+    
+    return img_tensor.clamp(0, 1)

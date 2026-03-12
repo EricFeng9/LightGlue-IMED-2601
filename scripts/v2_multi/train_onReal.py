@@ -16,20 +16,25 @@ from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
+from torch.utils.data import ConcatDataset
+from torch.utils.data._utils.collate import default_collate
 import logging
 from types import SimpleNamespace
 
 # 添加父目录到 sys.path
+# 先添加 LightGlue 目录，以便导入 lightglue 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+# 再添加项目根目录，以便导入 dataset 模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 # 导入 LightGlue
 from lightglue import LightGlue, SuperPoint
 from lightglue import viz2d
 
-# 导入数据集
-from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
-from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
-from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+# 导入数据集（使用与 test.py 一致的数据集）
+from dataset.CFFA.cffa_dataset import CFFADataset
+from dataset.CF_OCT.cf_oct_dataset import CFOCTDataset
+from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
 # 导入统一的测试/验证模块（使用 v2_multi 版本，与 metrics 保持一致）
 from scripts.v2_multi.test import UnifiedEvaluator
@@ -112,6 +117,21 @@ def compute_corner_error(H_est, H_gt, height, width):
     except:
         mace = float('inf')
     return mace
+
+def real_batch_collate(batch):
+    """Collate batch for RealDatasetWrapper: gt_pts0/gt_pts1 变长不 stack，保持为 list；pair_names 转为 (list_fix, list_mov)。"""
+    if not batch:
+        return {}
+    first = batch[0]
+    collated = {}
+    for k in first.keys():
+        if k == 'gt_pts0' or k == 'gt_pts1':
+            collated[k] = [sample[k] for sample in batch]
+        elif k == 'pair_names':
+            collated[k] = ([sample[k][0] for sample in batch], [sample[k][1] for sample in batch])
+        else:
+            collated[k] = default_collate([sample[k] for sample in batch])
+    return collated
 
 def create_chessboard(img1, img2, grid_size=4):
     H, W = img1.shape
@@ -245,49 +265,65 @@ class MultimodalDataModule(pl.LightningDataModule):
             # 根据模式选择数据集
             if self.args.mode == 'cfoct':
                 # CFOCT 模式: CF 为 fix, OCT 为 moving
-                data_dir = script_dir / 'data' / 'operation_pre_filtered_cfoct'
+                # 训练集: operation_pre_filtered_cfoct
+                train_data_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_cfoct'
+                # 测试集: CF_OCT (使用 val 集作为验证)
+                test_data_dir = script_dir.parent / 'dataset' / 'CF_OCT'
 
-                # 训练集
-                train_base = CFOCTDataset(root_dir=str(data_dir), split='train', mode='cf2oct')
-                self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
-                logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFOCT)")
+                # 导入 CFOCT 数据集
+                from dataset.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset as PreCFOCTDataset
+                
+                # 训练集 (使用 filtered 版本)
+                train_base = PreCFOCTDataset(root_dir=str(train_data_dir), split='train', mode='oct2cf')
+                self.train_dataset = RealDatasetWrapper(train_base, split_name='train', dataset_name='CFOCT')
+                logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFOCT - operation_pre_filtered_cfoct)")
 
-                # 验证集（使用测试集）
-                val_base = CFOCTDataset(root_dir=str(data_dir), split='test', mode='cf2oct')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
-                logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (CFOCT)")
+                # 验证集 (使用 CF_OCT val 集) - _01=OCT, _02=CF, 所以 fix=CF, moving=OCT
+                val_base = CFOCTDataset(root_dir=str(test_data_dir), split='val', mode='oct2cf')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='val', dataset_name='CFOCT')
+                logger.info(f"验证集加载 CFOCT val 集: {len(self.val_dataset)} 样本 (CF_OCT)")
             elif self.args.mode == 'octfa':
                 # OCTFA 模式: OCT 为 fix, FA 为 moving
-                data_dir = script_dir / 'data' / 'operation_pre_filtered_octfa'
+                data_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_octfa'
 
                 # 训练集
                 train_base = OCTFADataset(root_dir=str(data_dir), split='train', mode='fa2oct')
-                self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
+                self.train_dataset = RealDatasetWrapper(train_base, split_name='train', dataset_name='OCTFA')
                 logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (OCTFA)")
 
-                # 验证集（使用测试集）
-                val_base = OCTFADataset(root_dir=str(data_dir), split='test', mode='fa2oct')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
-                logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (OCTFA)")
+                # 验证集（使用 val 集）- 仅使用 OCTFA 模态
+                val_base = OCTFADataset(root_dir=str(data_dir), split='val', mode='fa2oct')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='val', dataset_name='OCTFA')
+                logger.info(f"验证集加载 OCTFA val 集: {len(self.val_dataset)} 样本")
             else:
                 # CFFA 模式 (默认): CF 为 fix, FA 为 moving
-                data_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
+                # 训练集: operation_pre_filtered_cffa
+                train_data_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_cffa'
+                # 测试集: CFFA (使用 val 集作为验证)
+                test_data_dir = script_dir.parent / 'dataset' / 'CFFA'
 
-                # 训练集
-                train_base = CFFADataset(root_dir=str(data_dir), split='train', mode='cf2fa')
-                self.train_dataset = RealDatasetWrapper(train_base, split_name='train')
-                logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFFA)")
+                # 导入 CFFA 数据集
+                from dataset.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset as PreCFFADataset
+                
+                # 训练集 (使用 filtered 版本)
+                train_base = PreCFFADataset(root_dir=str(train_data_dir), split='train', mode='fa2cf')
+                self.train_dataset = RealDatasetWrapper(train_base, split_name='train', dataset_name='CFFA')
+                logger.info(f"训练集加载: {len(self.train_dataset)} 样本 (CFFA - operation_pre_filtered_cffa)")
 
-                # 验证集（使用测试集）
-                val_base = CFFADataset(root_dir=str(data_dir), split='test', mode='cf2fa')
-                self.val_dataset = RealDatasetWrapper(val_base, split_name='test')
-                logger.info(f"验证集加载: {len(self.val_dataset)} 样本 (CFFA)")
+                # 验证集 (使用 CFFA val 集)
+                val_base = CFFADataset(root_dir=str(test_data_dir), split='val', mode='fa2cf')
+                self.val_dataset = RealDatasetWrapper(val_base, split_name='val', dataset_name='CFFA')
+                logger.info(f"验证集加载 CFFA val 集: {len(self.val_dataset)} 样本 (CFFA)")
 
     def train_dataloader(self):
-        return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
+        return torch.utils.data.DataLoader(
+            self.train_dataset, shuffle=True, collate_fn=real_batch_collate, **self.loader_params
+        )
 
     def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, shuffle=False, **self.loader_params)
+        return torch.utils.data.DataLoader(
+            self.val_dataset, shuffle=False, collate_fn=real_batch_collate, **self.loader_params
+        )
 
 # ==========================================
 # 模型类: PL_LightGlue_Real
@@ -310,6 +346,10 @@ class PL_LightGlue_Real(pl.LightningModule):
         
         # 使用统一的评估器
         self.evaluator = UnifiedEvaluator(mode='real', config=config)
+        
+        # 训练可视化相关
+        self.train_viz_done = False
+        self.train_viz_count = 0
 
     def configure_optimizers(self):
         lr = self.config.TRAINER.TRUE_LR
@@ -387,11 +427,77 @@ class PL_LightGlue_Real(pl.LightningModule):
         return loss
 
     def training_step(self, batch, batch_idx):
+        # 可视化第一个 epoch 的前 2 个 batch
+        if self.current_epoch == 0 and batch_idx < 2 and not self.train_viz_done:
+            self._visualize_train_batch(batch, batch_idx)
+            self.train_viz_count += 1
+            if self.train_viz_count >= 2:
+                self.train_viz_done = True
+        
         outputs = self(batch)
         loss = self._compute_loss(outputs, batch['keypoints0'], batch['keypoints1'], batch['T_0to1'])
         
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
+
+    def _visualize_train_batch(self, batch, batch_idx):
+        """可视化训练 batch 的输入数据"""
+        if self.result_dir is None:
+            return
+            
+        viz_dir = Path(self.result_dir) / 'train_viz_epoch0'
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        
+        batch_size = batch['image0'].shape[0]
+        
+        for i in range(batch_size):
+            # 获取各个版本的图像
+            img0 = batch['image0'][i, 0].cpu().numpy()      # fix
+            img1 = batch['image1'][i, 0].cpu().numpy()      # moving (original)
+            img1_gt = batch['image1_gt'][i, 0].cpu().numpy()  # moving GT
+            
+            # 对于真实数据，origin 就是当前的 image（没有增强）
+            img0_origin = img0.copy()
+            img1_origin = img1.copy()
+            
+            # 转换为 uint8
+            img0 = (img0 * 255).astype(np.uint8)
+            img1 = (img1 * 255).astype(np.uint8)
+            img0_origin = (img0_origin * 255).astype(np.uint8)
+            img1_origin = (img1_origin * 255).astype(np.uint8)
+            img1_gt = (img1_gt * 255).astype(np.uint8)
+            
+            # 保存各个图像
+            pair_names = batch.get('pair_names', (['unknown'] * batch_size, ['unknown'] * batch_size))
+            fix_name = pair_names[0][i] if isinstance(pair_names[0], list) else pair_names[0]
+            mov_name = pair_names[1][i] if isinstance(pair_names[1], list) else pair_names[1]
+            
+            sample_name = f"batch{batch_idx:02d}_sample{i:02d}_{Path(fix_name).stem}_vs_{Path(mov_name).stem}"
+            sample_dir = viz_dir / sample_name
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            
+            cv2.imwrite(str(sample_dir / 'fix.png'), img0)
+            cv2.imwrite(str(sample_dir / 'moving.png'), img1)
+            cv2.imwrite(str(sample_dir / 'fix_origin.png'), img0_origin)
+            cv2.imwrite(str(sample_dir / 'moving_origin.png'), img1_origin)
+            cv2.imwrite(str(sample_dir / 'moving_gt.png'), img1_gt)
+            
+            # 创建 chessboard 拼接图 (4x4)
+            # fix & moving
+            cb_fix_mov = create_chessboard(img1, img0, grid_size=4)
+            cv2.imwrite(str(sample_dir / 'chessboard_fix_vs_moving.png'), cb_fix_mov)
+            
+            # fix_origin & moving_origin
+            cb_fix_orig_mov_orig = create_chessboard(img1_origin, img0_origin, grid_size=4)
+            cv2.imwrite(str(sample_dir / 'chessboard_fix_origin_vs_moving_origin.png'), cb_fix_orig_mov_orig)
+            
+            # fix_origin & moving_gt
+            cb_fix_orig_mov_gt = create_chessboard(img1_gt, img0_origin, grid_size=4)
+            cv2.imwrite(str(sample_dir / 'chessboard_fix_origin_vs_moving_gt.png'), cb_fix_orig_mov_gt)
+            
+            logger.info(f"已保存训练可视化: {sample_dir}")
+        
+        logger.info(f"Batch {batch_idx} 可视化完成，共 {batch_size} 个样本")
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """验证步骤（使用统一的评估器）"""
@@ -764,7 +870,7 @@ def parse_args():
     parser.add_argument('--name', '-n', type=str, default='lightglue_baseline', help='训练名称')
     parser.add_argument('--mode', type=str, default='cffa', choices=['cffa', 'cfoct', 'octfa'], help='数据集模式: cffa, cfoct 或 octfa')
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--img_size', type=int, default=512)
     parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复')
     parser.add_argument('--max_epochs', type=int, default=200)

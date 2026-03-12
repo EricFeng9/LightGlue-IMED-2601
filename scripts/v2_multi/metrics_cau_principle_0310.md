@@ -1,7 +1,7 @@
 # 统一评估指标计算方案
 
 ## 文档信息
-- **版本**: v3.1 (CFFA/CF_OCT数据集更新 + 支持all模式)
+- **版本**: v3.2 (Seed机制 + num_workers=0)
 - **维护者**: Fengjunming
 - **最后更新**: 2026-03-11
 - **目的**: 保证不同配准模型之间评估流程和指标计算的一致性
@@ -521,4 +521,91 @@ Success = Acceptable + Inaccurate
 | Spatial Binning top_n | 20 | - |
 | 目标图像大小 | 512x512 | - |
 | Failed t_err | 1e6 | 用于AUC |
+
+
+
+---
+
+## 十一、随机种子 (Seed) 机制
+
+### 11.1 目的
+为了确保训练、验证和测试结果的可复现性，必须设置随机种子。
+
+### 11.2 支持 seed 的脚本
+
+| 脚本 | seed 参数 | 说明 |
+|------|-----------|------|
+| `test.py` | `--seed` | 测试脚本，支持指定 seed |
+| `test_all_operationpre.py` | `--seed` | 全面测试脚本，支持指定 seed |
+| `train_onMultiGen_vessels_enhanced.py` | `--seed` | 训练脚本，支持指定 seed |
+| `train_onReal.py` | `--seed` | 训练脚本，支持指定 seed |
+
+### 11.3 seed 使用方法
+
+```bash
+# 指定 seed（结果可复现）
+python scripts/v2_multi/test.py -s train_onMultiGen_vessels_enhanced \
+    -n 260309_4_v30_Multi_Hpatience_enhanced -t test_1_cfoct \
+    --seed 42 --num_workers 0
+
+# 不指定 seed（自动生成，基于毫秒级时间戳）
+python scripts/v2_multi/test.py -s train_onMultiGen_vessels_enhanced \
+    -n 260309_4_v30_Multi_Hpatience_enhanced -t test_1_cfoct \
+    --num_workers 0
+```
+
+### 11.4 seed 验证规则
+
+- seed 必须在 `[0, 2^31)` 范围内
+- 如果不指定 seed，系统自动生成：`int(time.time() * 1000) % (2**31)`
+
+### 11.5 seed 设置内容
+
+设置 seed 时，会同时设置以下随机源：
+
+```python
+import random
+import numpy as np
+import torch
+
+random.seed(seed)           # Python 随机库
+np.random.seed(seed)        # NumPy
+torch.manual_seed(seed)     # PyTorch CPU
+torch.cuda.manual_seed_all(seed)  # PyTorch GPU
+torch.backends.cudnn.deterministic = True  # CUDA 卷积确定性
+torch.backends.cudnn.benchmark = False     # 禁用 benchmark
+```
+
+### 11.6 注意事项
+
+即使设置了 seed，由于以下原因，**仍可能存在微小差异**：
+
+1. **CUDA 原子操作的非确定性**：某些 CUDA 操作执行顺序可能有微小差异
+2. **GPU 并行计算顺序**：相同 tensor 操作的执行顺序可能因并行方式不同
+3. **特征点检测算法**：SuperPoint 内部可能有一些随机操作
+
+通常这种差异很小（在小数点后几位），属于正常现象。配合 `--num_workers 0` 使用可最大化结果稳定性。
+
+---
+
+## 十二、num_workers 参数
+
+### 12.1 默认值
+
+所有训练和测试脚本的 `num_workers` 默认值设为 **0**，以减少多进程数据加载带来的不确定性。
+
+### 12.2 各脚本默认值
+
+| 脚本 | num_workers 默认值 |
+|------|-------------------|
+| `test.py` | 0 |
+| `test_all_operationpre.py` | 0 |
+| `train_onMultiGen_vessels_enhanced.py` | 0 |
+| `train_onReal.py` | 0 |
+
+### 12.3 说明
+
+- `num_workers=0` 表示在主进程中串行加载数据，消除了多进程调度的随机性
+- 牺牲一点数据加载速度，换取更高的结果可复现性
+- 特别是在调试和对比实验时，强烈建议使用 `num_workers=0`
 

@@ -17,11 +17,15 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import ConcatDataset
+from torch.utils.data._utils.collate import default_collate
 import logging
 from types import SimpleNamespace
 
 # 添加父目录到 sys.path 以支持导入
+# 先添加 LightGlue 目录，以便导入 lightglue 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+# 再添加项目根目录，以便导入 dataset 模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 # 导入 LightGlue 相关模块
 from lightglue import LightGlue, SuperPoint
@@ -31,17 +35,17 @@ from lightglue import viz2d
 # 注意：由于文件夹名包含点号，需要使用 importlib 动态导入
 import importlib.util
 spec = importlib.util.spec_from_file_location(
-    "multimodal_dataset_260305_1_v30", 
-    os.path.join(os.path.dirname(__file__), '../../data/260305_1_v30/260305_1_v30.py')
+    "multimodal_dataset_260305_1_v30",
+    os.path.join(os.path.dirname(__file__), '../../../dataset/260305_1_v30/260305_1_v30.py')
 )
 multimodal_dataset_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(multimodal_dataset_module)
 MultiModalDataset = multimodal_dataset_module.MultiModalDataset
 
-# 导入真实数据集（用于验证）
-from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
-from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
-from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+# 导入真实数据集（使用与 test.py 一致的数据集）
+from dataset.CFFA.cffa_dataset import CFFADataset
+from dataset.CF_OCT.cf_oct_dataset import CFOCTDataset
+from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
 # 导入统一的测试/验证模块（使用 v2_multi 版本，与 metrics 保持一致）
 from scripts.v2_multi.test import UnifiedEvaluator
@@ -133,6 +137,21 @@ def compute_corner_error(H_est, H_gt, height, width):
         mace = float('inf')
     return mace
 
+def real_batch_collate(batch):
+    """Collate batch for RealDatasetWrapper: gt_pts0/gt_pts1 变长不 stack，保持为 list；pair_names 转为 (list_fix, list_mov)。"""
+    if not batch:
+        return {}
+    first = batch[0]
+    collated = {}
+    for k in first.keys():
+        if k == 'gt_pts0' or k == 'gt_pts1':
+            collated[k] = [sample[k] for sample in batch]
+        elif k == 'pair_names':
+            collated[k] = ([sample[k][0] for sample in batch], [sample[k][1] for sample in batch])
+        else:
+            collated[k] = default_collate([sample[k] for sample in batch])
+    return collated
+
 def create_chessboard(img1, img2, grid_size=4):
     """创建棋盘格对比图"""
     H, W = img1.shape
@@ -150,7 +169,7 @@ def create_chessboard(img1, img2, grid_size=4):
     return chessboard
 
 # 导入域随机化增强模块
-from scripts.v2_multi.gen_data_enhance import random_domain_augment_image
+from scripts.v2_multi.gen_data_enhance import random_domain_augment_image, random_domain_augment_pair
 
 # ==========================================
 # 辅助类: GenDatasetWrapper (格式转换，适配 260305_1_v30 数据集)
@@ -180,6 +199,10 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
         image1 = data['image1']  # [1, H, W]
         image1_gt = data['image1_gt']  # [1, H, W] - 不应用增强，用于评估
 
+        # 保存增强前的原始图像（用于可视化）
+        image0_origin = image0.clone()
+        image1_origin = image1.clone()
+
         # 应用域随机化增强 (只对训练图像应用，不对 GT 图像应用)
         if self.apply_domain_aug:
             # 将 tensor 转为 numpy 进行增强处理
@@ -187,9 +210,8 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
             img0_np = image0.squeeze(0).cpu().numpy()
             img1_np = image1.squeeze(0).cpu().numpy()
 
-            # 应用域随机化增强
-            img0_aug = random_domain_augment_image(img0_np)
-            img1_aug = random_domain_augment_image(img1_np)
+            # 应用域随机化增强 - 使用统一的随机参数
+            img0_aug, img1_aug = random_domain_augment_pair(img0_np, img1_np)
 
             # 转换回 tensor
             image0 = torch.from_numpy(img0_aug).unsqueeze(0).float()
@@ -197,9 +219,11 @@ class GenDatasetWrapper(torch.utils.data.Dataset):
 
         # 构建返回结果
         result = {
-            'image0': image0,                  # [1, H, W] fix (固定图)
-            'image1': image1,                  # [1, H, W] moving (形变)
+            'image0': image0,                  # [1, H, W] fix (固定图，增强后)
+            'image1': image1,                  # [1, H, W] moving (形变，增强后)
             'image1_gt': image1_gt,            # [1, H, W] moving (原始未形变)
+            'image0_origin': image0_origin,    # [1, H, W] fix (增强前)
+            'image1_origin': image1_origin,    # [1, H, W] moving (增强前)
             'T_0to1': data['T_0to1'],         # [3, 3] 变换矩阵
             'pair_names': data['pair_names'],
             'dataset_name': data['dataset_name']
@@ -329,40 +353,57 @@ class MultimodalDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
-            # 训练集使用生成数据 (260305_1_v30)
-            # 验证集合并三个真实数据集的测试集
-            # 使用绝对路径确保在任何目录下运行都能找到数据
+            # 训练集使用生成数据 (260305_1_v30) 的全量数据（train + val）
+            # 验证集使用全量真实数据进行验证
             script_dir = Path(__file__).parent.parent.parent
-            
-            # 训练集：生成数据 (260305_1_v30) - 支持 cf, fa, oct 随机两两配对
-            train_data_dir = script_dir / 'data' / '260305_1_v30'
+
+            # 训练集：生成数据 (260305_1_v30) 全量数据 - 支持 cf, fa, oct 随机两两配对
+            # 数据在 /data/student/Fengjunming/diffusion_registration/dataset/260305_1_v30
+            train_data_dir = script_dir / '../dataset' / '260305_1_v30'
+
+            # 加载 train split
             train_base = MultiModalDataset(
-                root_dir=str(train_data_dir), 
-                split='train', 
+                root_dir=str(train_data_dir),
+                split='train',
                 img_size=self.args.img_size
                 # 默认支持所有模态随机配对
             )
-            self.train_dataset = GenDatasetWrapper(train_base, apply_domain_aug=True)
-            logger.info(f"训练集加载 260305_1_v30 生成数据: {len(self.train_dataset)} 样本 (已启用域随机化增强)")
+            train_dataset = GenDatasetWrapper(train_base, apply_domain_aug=True)
+            logger.info(f"训练集加载 260305_1_v30 train split: {len(train_dataset)} 样本 (已启用域随机化增强)")
+
+            # 加载 val split 并入训练集
+            val_base = MultiModalDataset(
+                root_dir=str(train_data_dir),
+                split='val',
+                img_size=self.args.img_size
+            )
+            val_dataset = GenDatasetWrapper(val_base, apply_domain_aug=True)
+            logger.info(f"训练集加载 260305_1_v30 val split: {len(val_dataset)} 样本 (已启用域随机化增强)")
             
-            # 验证集：合并三个真实数据集的测试集
-            # 1) CFFA 测试集
-            cffa_dir = script_dir / 'data' / 'operation_pre_filtered_cffa'
-            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='test', mode='cf2fa')
-            cffa_dataset = RealDatasetWrapper(cffa_base, split_name='test', dataset_name='CFFA')
-            logger.info(f"验证集加载 CFFA 测试集: {len(cffa_dataset)} 样本")
+            # 合并 train 和 val 作为全量训练数据
+            self.train_dataset = ConcatDataset([train_dataset, val_dataset])
+            logger.info(f"训练集总样本数 (train + val): {len(self.train_dataset)}")
             
-            # 2) CFOCT 测试集
-            cfoct_dir = script_dir / 'data' / 'operation_pre_filtered_cfoct'
-            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='test', mode='cf2oct')
-            cfoct_dataset = RealDatasetWrapper(cfoct_base, split_name='test', dataset_name='CFOCT')
-            logger.info(f"验证集加载 CFOCT 测试集: {len(cfoct_dataset)} 样本")
+            # 验证集：使用全量真实数据（与 train_onGen_vessels_enhanced.py 一致）
+            # CFFA 和 CFOCT 使用全量数据（split='all'）
             
-            # 3) OCTFA 测试集
-            octfa_dir = script_dir / 'data' / 'operation_pre_filtered_octfa'
-            octfa_base = OCTFADataset(root_dir=str(octfa_dir), split='test', mode='fa2oct')
-            octfa_dataset = RealDatasetWrapper(octfa_base, split_name='test', dataset_name='OCTFA')
-            logger.info(f"验证集加载 OCTFA 测试集: {len(octfa_dataset)} 样本")
+            # 1) CFFA 全量数据集 (来自 dataset/CFFA)
+            cffa_dir = script_dir.parent / 'dataset' / 'CFFA'
+            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='all', mode='fa2cf')
+            cffa_dataset = RealDatasetWrapper(cffa_base, split_name='all', dataset_name='CFFA')
+            logger.info(f"验证集加载 CFFA 全量集: {len(cffa_dataset)} 样本")
+            
+            # 2) CFOCT 全量数据集 (来自 dataset/CF_OCT)
+            cfoct_dir = script_dir.parent / 'dataset' / 'CF_OCT'
+            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='all', mode='oct2cf')
+            cfoct_dataset = RealDatasetWrapper(cfoct_base, split_name='all', dataset_name='CFOCT')
+            logger.info(f"验证集加载 CFOCT 全量集: {len(cfoct_dataset)} 样本")
+            
+            # 3) OCTFA val 集 (来自 dataset/operation_pre_filtered_octfa)
+            octfa_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_octfa'
+            octfa_base = OCTFADataset(root_dir=str(octfa_dir), split='val', mode='fa2oct')
+            octfa_dataset = RealDatasetWrapper(octfa_base, split_name='val', dataset_name='OCTFA')
+            logger.info(f"验证集加载 OCTFA val 集: {len(octfa_dataset)} 样本")
             
             # 合并三个验证集
             self.val_dataset = ConcatDataset([cffa_dataset, cfoct_dataset, octfa_dataset])
@@ -372,7 +413,9 @@ class MultimodalDataModule(pl.LightningDataModule):
         return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
 
     def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, shuffle=False, **self.loader_params)
+        return torch.utils.data.DataLoader(
+            self.val_dataset, shuffle=False, collate_fn=real_batch_collate, **self.loader_params
+        )
 
 # ==========================================
 # 核心模型: PL_LightGlue_Gen
@@ -402,6 +445,10 @@ class PL_LightGlue_Gen(pl.LightningModule):
         
         # 使用统一的评估器
         self.evaluator = UnifiedEvaluator(mode='gen', config=config)
+        
+        # 训练可视化相关
+        self.train_viz_done = False  # 标记是否已完成训练可视化
+        self.train_viz_count = 0     # 已可视化的 batch 数
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -528,6 +575,13 @@ class PL_LightGlue_Gen(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """训练步骤（生成数据训练）"""
+        # 可视化第一个 epoch 的前 2 个 batch
+        if self.current_epoch == 0 and batch_idx < 2 and not self.train_viz_done:
+            self._visualize_train_batch(batch, batch_idx)
+            self.train_viz_count += 1
+            if self.train_viz_count >= 2:
+                self.train_viz_done = True
+        
         outputs = self(batch)
         
         # 获取血管掩码（如果存在）
@@ -544,6 +598,63 @@ class PL_LightGlue_Gen(pl.LightningModule):
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train/vessel_weight', self.vessel_loss_weight, on_step=False, on_epoch=True, prog_bar=True)
         return loss
+
+    def _visualize_train_batch(self, batch, batch_idx):
+        """可视化训练 batch 的输入数据"""
+        if self.result_dir is None:
+            return
+            
+        viz_dir = Path(self.result_dir) / 'train_viz_epoch0'
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        
+        batch_size = batch['image0'].shape[0]
+        
+        for i in range(batch_size):
+            # 获取各个版本的图像
+            img0 = batch['image0'][i, 0].cpu().numpy()      # 增强后的 fix
+            img1 = batch['image1'][i, 0].cpu().numpy()      # 增强后的 moving
+            img0_origin = batch['image0_origin'][i, 0].cpu().numpy()  # 增强前的 fix
+            img1_origin = batch['image1_origin'][i, 0].cpu().numpy()  # 增强前的 moving
+            img1_gt = batch['image1_gt'][i, 0].cpu().numpy()  # moving GT (未形变)
+            
+            # 转换为 uint8
+            img0 = (img0 * 255).astype(np.uint8)
+            img1 = (img1 * 255).astype(np.uint8)
+            img0_origin = (img0_origin * 255).astype(np.uint8)
+            img1_origin = (img1_origin * 255).astype(np.uint8)
+            img1_gt = (img1_gt * 255).astype(np.uint8)
+            
+            # 保存各个图像
+            pair_names = batch.get('pair_names', (['unknown'] * batch_size, ['unknown'] * batch_size))
+            fix_name = pair_names[0][i] if isinstance(pair_names[0], list) else pair_names[0]
+            mov_name = pair_names[1][i] if isinstance(pair_names[1], list) else pair_names[1]
+            
+            sample_name = f"batch{batch_idx:02d}_sample{i:02d}_{Path(fix_name).stem}_vs_{Path(mov_name).stem}"
+            sample_dir = viz_dir / sample_name
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            
+            cv2.imwrite(str(sample_dir / 'fix_aug.png'), img0)
+            cv2.imwrite(str(sample_dir / 'moving_aug.png'), img1)
+            cv2.imwrite(str(sample_dir / 'fix_origin.png'), img0_origin)
+            cv2.imwrite(str(sample_dir / 'moving_origin.png'), img1_origin)
+            cv2.imwrite(str(sample_dir / 'moving_gt.png'), img1_gt)
+            
+            # 创建 chessboard 拼接图 (4x4)
+            # fix & moving_aug
+            cb_fix_mov = create_chessboard(img1, img0, grid_size=4)
+            cv2.imwrite(str(sample_dir / 'chessboard_fix_vs_moving.png'), cb_fix_mov)
+            
+            # fix_origin & moving_origin
+            cb_fix_orig_mov_orig = create_chessboard(img1_origin, img0_origin, grid_size=4)
+            cv2.imwrite(str(sample_dir / 'chessboard_fix_origin_vs_moving_origin.png'), cb_fix_orig_mov_orig)
+            
+            # fix_origin & moving_gt (未形变的 GT)
+            cb_fix_orig_mov_gt = create_chessboard(img1_gt, img0_origin, grid_size=4)
+            cv2.imwrite(str(sample_dir / 'chessboard_fix_origin_vs_moving_gt.png'), cb_fix_orig_mov_gt)
+            
+            logger.info(f"已保存训练可视化: {sample_dir}")
+        
+        logger.info(f"Batch {batch_idx} 可视化完成，共 {batch_size} 个样本")
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """验证步骤（使用统一的评估器）"""
@@ -592,7 +703,7 @@ class MultimodalValidationCallback(Callback):
         super().__init__()
         self.args = args
         self.best_val = -1.0
-        self.result_dir = Path(f"results/lightglue_{args.mode}/{args.name}")
+        self.result_dir = Path(f"results/lightglue_gen/{args.name}")
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_mses = []
         self.epoch_maces = []
@@ -721,8 +832,9 @@ class MultimodalValidationCallback(Callback):
         val_dataloader = trainer.val_dataloaders[0] if isinstance(trainer.val_dataloaders, list) else trainer.val_dataloaders
         pl_module.eval()
         
-        # 每种验证数据集最多可视化的样本数
-        max_per_dataset = 5
+        # 每种验证数据集最多可视化的样本数 (总共最多 12 个)
+        max_per_dataset = 4
+        max_total = 12
         per_dataset_counts = {}
         total_visualized = 0
         
@@ -740,8 +852,8 @@ class MultimodalValidationCallback(Callback):
                     sample_split = splits[i] if isinstance(splits, list) else splits
                     sample_dataset = dataset_names[i] if isinstance(dataset_names, list) else dataset_names
                     
-                    # 只可视化 test split
-                    if sample_split in ('test', 'val'):
+                    # 只可视化 test/val/all split 的样本
+                    if sample_split in ('test', 'val', 'all'):
                         cur_count = per_dataset_counts.get(sample_dataset, 0)
                         if cur_count < max_per_dataset:
                             self._process_batch_sample(
@@ -752,10 +864,14 @@ class MultimodalValidationCallback(Callback):
                             per_dataset_counts[sample_dataset] = cur_count + 1
                             total_visualized += 1
                         
-                        # 三个验证集都达到上限就停止
+                        # 达到总数上限或三个验证集都达到上限就停止
+                        if total_visualized >= max_total:
+                            break
                         if len(per_dataset_counts) >= 3 and all(c >= max_per_dataset for c in per_dataset_counts.values()):
                             break
                 
+                if total_visualized >= max_total:
+                    break
                 if len(per_dataset_counts) >= 3 and all(c >= max_per_dataset for c in per_dataset_counts.values()):
                     break
         
@@ -897,7 +1013,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LightGlue Vessel-Guided Training")
     parser.add_argument('--name', '-n', type=str, default='260303_vessel_guided', help='训练名称')
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--img_size', type=int, default=512)
     parser.add_argument('--start_point', type=str, default=None, help='从检查点恢复训练')
     parser.add_argument('--max_epochs', type=int, default=200)
@@ -1021,7 +1137,7 @@ def main():
     # 如果指定了检查点，从检查点恢复
     ckpt_path = args.start_point if args.start_point else None
     
-    logger.info(f"开始训练 (训练集: 260305_1_v30 生成数据 | 验证集: CFFA+CFOCT+OCTFA 合并真实数据): {args.name}")
+    logger.info(f"开始训练 (训练集: 260305_1_v30 生成数据 | 验证集: CFFA+CFOCT+OCTFA 合并真实数据(全量)): {args.name}")
     logger.info("策略: 血管loss引导的课程学习")
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 

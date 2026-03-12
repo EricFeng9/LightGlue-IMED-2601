@@ -32,7 +32,6 @@ from lightglue import LightGlue, SuperPoint
 from lightglue import viz2d
 
 # 导入生成数据集 (260311_multiGen_aug)
-# 注意：由于文件夹名包含点号，需要使用 importlib 动态导入
 import importlib.util
 spec = importlib.util.spec_from_file_location(
     "multimodal_dataset_260311_multiGen_aug",
@@ -350,14 +349,24 @@ class MultimodalDataModule(pl.LightningDataModule):
             'num_workers': args.num_workers,
             'pin_memory': True
         }
+        # 解析 mode 参数，确定要使用的配对模式
+        # mode: cffa -> pair_mode='cffa', val_mode='CFFA'
+        # mode: cfoct -> pair_mode='cfoct', val_mode='CFOCT'
+        # mode: octfa -> pair_mode='octfa', val_mode='OCTFA'
+        # mode: None -> pair_mode=None, val_mode=None (使用所有)
+        self.train_pair_mode = args.mode if args.mode else None
+        self.val_mode_filter = args.mode if args.mode else None  # 用于筛选验证集
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
             # 训练集使用生成数据 (260311_multiGen_aug) 的全量数据（train + val）
-            # 验证集使用全量真实数据进行验证
+            # 验证集根据 mode 参数筛选真实数据
+            # 使用绝对路径确保在任何目录下运行都能找到数据
             script_dir = Path(__file__).parent.parent.parent
 
-            # 训练集：生成数据 (260311_multiGen_aug) 全量数据 - 支持 cf, fa, oct 随机两两配对
+            # 训练集：生成数据 (260311_multiGen_aug) 全量数据
+            # 根据 mode 参数筛选配对模式
+            # script_dir = /data/student/Fengjunming/diffusion_registration/LightGlue
             # 数据在 /data/student/Fengjunming/diffusion_registration/dataset/260311_multiGen_aug
             train_data_dir = script_dir / '../dataset' / '260311_multiGen_aug'
 
@@ -365,28 +374,30 @@ class MultimodalDataModule(pl.LightningDataModule):
             train_base = MultiModalDataset(
                 root_dir=str(train_data_dir),
                 split='train',
-                img_size=self.args.img_size
-                # 默认支持所有模态随机配对
+                img_size=self.args.img_size,
+                pair_mode=self.train_pair_mode  # 根据 mode 参数筛选
             )
-            train_dataset = GenDatasetWrapper(train_base, apply_domain_aug=False)
-            logger.info(f"训练集加载 260311_multiGen_aug train split: {len(train_dataset)} 样本 (已禁用域随机化增强)")
+            train_dataset = GenDatasetWrapper(train_base, apply_domain_aug=True)
+            logger.info(f"训练集加载 260311_multiGen_aug train split: {len(train_dataset)} 样本 "
+                        f"(pair_mode={self.train_pair_mode}, 已启用域随机化增强)")
 
             # 加载 val split 并入训练集
             val_base = MultiModalDataset(
                 root_dir=str(train_data_dir),
                 split='val',
-                img_size=self.args.img_size
+                img_size=self.args.img_size,
+                pair_mode=self.train_pair_mode  # 根据 mode 参数筛选
             )
-            val_dataset = GenDatasetWrapper(val_base, apply_domain_aug=False)
-            logger.info(f"训练集加载 260311_multiGen_aug val split: {len(val_dataset)} 样本 (已禁用域随机化增强)")
+            val_dataset = GenDatasetWrapper(val_base, apply_domain_aug=True)
+            logger.info(f"训练集加载 260311_multiGen_aug val split: {len(val_dataset)} 样本 "
+                        f"(pair_mode={self.train_pair_mode}, 已启用域随机化增强)")
             
             # 合并 train 和 val 作为全量训练数据
             self.train_dataset = ConcatDataset([train_dataset, val_dataset])
             logger.info(f"训练集总样本数 (train + val): {len(self.train_dataset)}")
             
-            # 验证集：使用全量真实数据（与 train_onGen_vessels_enhanced.py 一致）
-            # CFFA 和 CFOCT 使用全量数据（split='all'）
-            
+            # 验证集：根据 mode 参数筛选真实数据
+            # CFFA 和 CFOCT 使用全量数据（split='all'），因为它们的训练集不参与训练
             # 1) CFFA 全量数据集 (来自 dataset/CFFA)
             cffa_dir = script_dir.parent / 'dataset' / 'CFFA'
             cffa_base = CFFADataset(root_dir=str(cffa_dir), split='all', mode='fa2cf')
@@ -405,9 +416,20 @@ class MultimodalDataModule(pl.LightningDataModule):
             octfa_dataset = RealDatasetWrapper(octfa_base, split_name='val', dataset_name='OCTFA')
             logger.info(f"验证集加载 OCTFA val 集: {len(octfa_dataset)} 样本")
             
-            # 合并三个验证集
-            self.val_dataset = ConcatDataset([cffa_dataset, cfoct_dataset, octfa_dataset])
-            logger.info(f"验证集总样本数: {len(self.val_dataset)}")
+            # 根据 mode 参数筛选验证集
+            if self.val_mode_filter == 'cffa':
+                self.val_dataset = cffa_dataset
+                logger.info(f"验证集筛选: 只使用 CFFA ({len(self.val_dataset)} 样本)")
+            elif self.val_mode_filter == 'cfoct':
+                self.val_dataset = cfoct_dataset
+                logger.info(f"验证集筛选: 只使用 CFOCT ({len(self.val_dataset)} 样本)")
+            elif self.val_mode_filter == 'octfa':
+                self.val_dataset = octfa_dataset
+                logger.info(f"验证集筛选: 只使用 OCTFA ({len(self.val_dataset)} 样本)")
+            else:
+                # 使用所有验证集
+                self.val_dataset = ConcatDataset([cffa_dataset, cfoct_dataset, octfa_dataset])
+                logger.info(f"验证集总样本数 (全部): {len(self.val_dataset)}")
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
@@ -703,7 +725,9 @@ class MultimodalValidationCallback(Callback):
         super().__init__()
         self.args = args
         self.best_val = -1.0
-        self.result_dir = Path(f"results/lightglue_gen/{args.name}")
+        # 构建 result_dir 路径，包含 mode 信息
+        mode_str = args.mode if args.mode else 'all'
+        self.result_dir = Path(f"results/lightglue_gen_{mode_str}/{args.name}")
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.epoch_mses = []
         self.epoch_maces = []
@@ -1024,21 +1048,26 @@ def parse_args():
     parser.add_argument('--weaning_end', type=int, default=100, help='断奶期结束 epoch')
     parser.add_argument('--max_vessel_weight', type=float, default=10.0, help='血管权重最大值')
     parser.add_argument('--min_vessel_weight', type=float, default=1.0, help='血管权重最小值')
+    parser.add_argument('--mode', type=str, default=None,
+                        choices=['cffa', 'cfoct', 'octfa'],
+                        help='训练模式: cffa(CF-FA), cfoct(CF-OCT), octfa(OCT-FA). '
+                             '不指定则使用所有模态数据')
     parser.add_argument('--patience', type=int, default=10, help='早停和学习率调度的 patience 值')
     
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    args.mode = 'gen'  # 固定为生成数据模式
+    # args.mode 由用户在命令行指定: cffa/cfoct/octfa/None
     
     config = get_default_config()
     config.TRAINER.SEED = 66
     config.TRAINER.PATIENCE = args.patience  # 使用传入的 patience 值
     pl.seed_everything(config.TRAINER.SEED)
     
-    # 修复路径
-    result_dir = Path(f"results/lightglue_{args.mode}/{args.name}")
+    # 构建 result_dir 路径，包含 mode 信息
+    mode_str = args.mode if args.mode else 'all'
+    result_dir = Path(f"results/lightglue_gen_{mode_str}/{args.name}")
     result_dir.mkdir(parents=True, exist_ok=True)
     log_file = result_dir / "log.txt"
     
@@ -1107,10 +1136,31 @@ def main():
     
     # 确保 args 有 mode 属性（用于回调）
     if not hasattr(args, 'mode'):
-        args.mode = 'gen'
+        args.mode = None
+    
+    # 根据 mode 参数构建训练和验证集描述
+    mode_desc = {
+        'cffa': 'CF-FA (cffa)',
+        'cfoct': 'CF-OCT (cfoct)',
+        'octfa': 'OCT-FA (octfa)',
+        None: '全部模态 (cffa + cfoct + octfa)'
+    }
+    train_desc = mode_desc.get(args.mode, mode_desc[None])
+    val_desc = mode_desc.get(args.mode, mode_desc[None])
+    
+    # 验证集描述需要根据 mode 映射到对应的真实数据集
+    if args.mode == 'cffa':
+        val_desc = 'CFFA 真实数据'
+    elif args.mode == 'cfoct':
+        val_desc = 'CFOCT 真实数据'
+    elif args.mode == 'octfa':
+        val_desc = 'OCTFA 真实数据'
+    else:
+        val_desc = 'CFFA + CFOCT + OCTFA 合并真实数据'
     
     logger.info(f"GPU 配置: devices={gpus_list}, num_gpus={_n_gpus}")
     logger.info(f"学习率: {config.TRAINER.TRUE_LR:.6f} (scaled from {config.TRAINER.CANONICAL_LR})")
+    logger.info(f"模式参数: --mode={args.mode}")
     
     # Trainer 配置
     trainer_kwargs = {
@@ -1137,7 +1187,7 @@ def main():
     # 如果指定了检查点，从检查点恢复
     ckpt_path = args.start_point if args.start_point else None
     
-    logger.info(f"开始训练 (训练集: 260311_multiGen_aug 生成数据 | 验证集: CFFA+CFOCT+OCTFA 合并真实数据(全量)): {args.name}")
+    logger.info(f"开始训练 (训练集: 260311_multiGen_aug {train_desc} 生成数据 | 验证集: {val_desc}): {args.name}")
     logger.info("策略: 血管loss引导的课程学习")
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 

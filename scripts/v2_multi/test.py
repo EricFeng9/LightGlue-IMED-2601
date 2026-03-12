@@ -5,6 +5,7 @@
 - train_onMultiGen_vessels_enhanced.py
 - train_onMultiGen_vessels.py
 - train_onReal.py
+- train_onGen_vessels_enhanced.py
 """
 
 import sys
@@ -19,7 +20,10 @@ import pytorch_lightning as pl
 from torch.utils.data import ConcatDataset, DataLoader
 import csv
 
-# 添加父目录到 sys.path（必须在前，因为 lightglue 是本地模块）
+# 添加父目录到 sys.path
+# 先添加项目根目录，以便导入 dataset 模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
+# 再添加 LightGlue 目录，以便导入 lightglue 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 # 导入 LightGlue 预训练模型
@@ -35,10 +39,10 @@ from scripts.v2_multi.metrics import (
 )
 
 # 导入真实数据集
-from data.CFFA.cffa_dataset import CFFADataset
-from data.CF_OCT.cf_oct_dataset import CFOCTDataset
-from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
-from data.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
+from dataset.CFFA.cffa_dataset import CFFADataset
+from dataset.CF_OCT.cf_oct_dataset import CFOCTDataset
+from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+from dataset.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
 
 
 def is_valid_homography(H, scale_min=0.1, scale_max=10.0, perspective_threshold=0.005):
@@ -175,46 +179,49 @@ class TestDataModule:
             'pin_memory': True
         }
 
-    def get_test_dataloader(self, datasets=None):
+    def get_test_dataloader(self, datasets=None, seed=None):
         """
         获取测试数据加载器
         datasets: list of dataset names to include, e.g., ['CFFA', 'CFOCT', 'OCTFA']
                  if None, load all datasets
+        seed: 随机种子，用于确保数据加载顺序可复现（仅用于设置PyTorch等，其他随机操作由数据集自行管理）
         """
         import torch
         script_dir = Path(__file__).parent.parent.parent
         val_dataset_list = []
 
         if datasets is None or 'CFFA' in datasets:
-            cffa_dir = script_dir / 'data' / 'CFFA'
-            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='all', mode='cf2fa')
+            cffa_dir = script_dir.parent / 'dataset' / 'CFFA'
+            cffa_base = CFFADataset(root_dir=str(cffa_dir), split='all', mode='fa2cf')
             cffa_dataset = RealDatasetWrapper(cffa_base, split_name='test', dataset_name='CFFA')
             logger.info(f"加载 CFFA 测试集 (全部数据): {len(cffa_dataset)} 样本")
             val_dataset_list.append(cffa_dataset)
 
         if datasets is None or 'CFOCT' in datasets:
-            cfoct_dir = script_dir / 'data' / 'CF_OCT'
-            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='all', mode='oct2fa')
+            cfoct_dir = script_dir.parent / 'dataset' / 'CF_OCT'
+            cfoct_base = CFOCTDataset(root_dir=str(cfoct_dir), split='all', mode='oct2cf')
             cfoct_dataset = RealDatasetWrapper(cfoct_base, split_name='test', dataset_name='CFOCT')
             logger.info(f"加载 CFOCT 测试集 (全部数据): {len(cfoct_dataset)} 样本")
             val_dataset_list.append(cfoct_dataset)
 
         if datasets is None or 'OCTFA' in datasets:
-            octfa_dir = script_dir / 'data' / 'operation_pre_filtered_octfa'
+            octfa_dir = script_dir.parent / 'dataset' / 'operation_pre_filtered_octfa'
             octfa_base = OCTFADataset(root_dir=str(octfa_dir), split='val', mode='fa2oct')
             octfa_dataset = RealDatasetWrapper(octfa_base, split_name='test', dataset_name='OCTFA')
             logger.info(f"加载 OCTFA 测试集: {len(octfa_dataset)} 样本")
             val_dataset_list.append(octfa_dataset)
 
         if datasets is None or 'CFOCTA' in datasets:
-            cfocta_dir = script_dir / 'data' / 'CF_OCTA_v2_repaired'
-            cfocta_base = CFOCTADataset(root_dir=str(cfocta_dir), split='val', mode='cf2octa')
+            cfocta_dir = script_dir.parent / 'dataset' / 'CF_OCTA_v2_repaired'
+            cfocta_base = CFOCTADataset(root_dir=str(cfocta_dir), split='val', mode='octa2cf')
             cfocta_dataset = RealDatasetWrapper(cfocta_base, split_name='test', dataset_name='CFOCTA')
             logger.info(f"加载 CFOCTA 测试集: {len(cfocta_dataset)} 样本")
             val_dataset_list.append(cfocta_dataset)
 
         val_dataset = ConcatDataset(val_dataset_list)
         logger.info(f"测试集总样本数: {len(val_dataset)}")
+
+        # 注意：不设置 worker_init_fn，因为数据集内部的随机操作应保持独立
         return DataLoader(val_dataset, shuffle=False, **self.loader_params)
 
 
@@ -417,6 +424,10 @@ def run_evaluation(pl_module, dataloader, config, verbose=True, save_visualizati
     evaluator = UnifiedEvaluator(config=config)
 
     pl_module.eval()
+
+    # 全局样本计数器，用于按测试顺序保存可视化
+    sample_counter = 0
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v
@@ -426,7 +437,7 @@ def run_evaluation(pl_module, dataloader, config, verbose=True, save_visualizati
             result = evaluator.evaluate_batch(batch, outputs, pl_module)
 
             if save_visualizations and output_dir:
-                _visualize_batch(batch, result, output_dir, batch_idx)
+                sample_counter = _visualize_batch(batch, result, output_dir, batch_idx, sample_counter)
 
             if verbose and batch_idx % 10 == 0:
                 logger.info(f"已处理 {batch_idx + 1} 个 batch")
@@ -439,8 +450,10 @@ def run_evaluation(pl_module, dataloader, config, verbose=True, save_visualizati
     return metrics
 
 
-def _visualize_batch(batch, outputs, output_dir, batch_idx):
-    """可视化一个batch的结果"""
+def _visualize_batch(batch, outputs, output_dir, batch_idx, sample_counter=0):
+    """可视化一个batch的结果
+    返回更新后的 sample_counter
+    """
     import matplotlib.pyplot as plt
     from lightglue import viz2d
 
@@ -450,6 +463,9 @@ def _visualize_batch(batch, outputs, output_dir, batch_idx):
     dataset_names = batch.get('dataset_name', ['unknown'] * batch_size)
 
     for sample_idx in range(batch_size):
+        # 使用全局递增的样本编号，确保按测试顺序保存
+        global_sample_idx = sample_counter + sample_idx
+
         H_est = H_ests[sample_idx]
 
         if not is_valid_homography(H_est):
@@ -470,9 +486,9 @@ def _visualize_batch(batch, outputs, output_dir, batch_idx):
 
         pair_names = batch.get('pair_names', None)
         if pair_names:
-            sample_name = f"{dataset_name}_batch{batch_idx:04d}_sample{sample_idx:02d}_{Path(pair_names[0][sample_idx]).stem}_vs_{Path(pair_names[1][sample_idx]).stem}"
+            sample_name = f"sample_{global_sample_idx:05d}_{dataset_name}_{Path(pair_names[0][sample_idx]).stem}_vs_{Path(pair_names[1][sample_idx]).stem}"
         else:
-            sample_name = f"{dataset_name}_batch{batch_idx:04d}_sample{sample_idx:02d}"
+            sample_name = f"sample_{global_sample_idx:05d}_{dataset_name}"
 
         save_path = output_dir / sample_name
         save_path.mkdir(parents=True, exist_ok=True)
@@ -546,6 +562,9 @@ def _visualize_batch(batch, outputs, output_dir, batch_idx):
                     num_matches = torch.sum(valid).item()
                     f.write(f"Matches: {num_matches}\n")
 
+    # 返回更新后的样本计数器
+    return sample_counter + batch_size
+
 
 def create_chessboard(img1, img2, grid_size=4):
     """创建棋盘格对比图"""
@@ -582,6 +601,12 @@ def get_train_script_config(train_script):
             'class_name': 'PL_LightGlue_Gen',
             'result_dir': 'lightglue_gen'
         },
+        'train_onGen_vessels_enhanced': {
+            'import_path': 'scripts.v2_multi.train_onGen_vessels_enhanced',
+            'class_name': 'PL_LightGlue_Gen',
+            'result_dir': 'lightglue_gen_{train_mode}',
+            'use_train_mode': True
+        },
         'train_onReal': {
             'import_path': 'scripts.v2_multi.train_onReal',
             'class_name': 'PL_LightGlue_Real',
@@ -599,7 +624,7 @@ def parse_args():
     # 支持的训练脚本
     parser.add_argument('--train_script', '-s', type=str, required=True,
                         choices=['train_onGen', 'train_onMultiGen_vessels_enhanced',
-                                'train_onMultiGen_vessels', 'train_onReal'],
+                                'train_onMultiGen_vessels', 'train_onReal', 'train_onGen_vessels_enhanced'],
                         help='训练脚本名称')
 
     # train_onGen/Real 专用参数
@@ -622,7 +647,8 @@ def parse_args():
     parser.add_argument('--checkpoint', '-c', type=str, default=None,
                         help='检查点路径（默认使用 best_checkpoint/model.ckpt）')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
-    parser.add_argument('--num_workers', type=int, default=8, help='数据加载线程数')
+    parser.add_argument('--num_workers', type=int, default=0, help='数据加载线程数')
+    parser.add_argument('--seed', type=int, default=None, help='随机种子（不指定则自动生成）')
     parser.add_argument('--gpus', type=str, default='0', help='GPU设备ID')
     parser.add_argument('--img_size', type=int, default=512, help='图像大小')
     parser.add_argument('--no_viz', action='store_true', help='禁用可视化')
@@ -634,15 +660,36 @@ def main():
     """主函数"""
     args = parse_args()
 
+    # 设置随机种子（如果未指定则自动生成）
+    if args.seed is None:
+        import time
+        args.seed = int(time.time() * 1000) % (2**31)  # 毫秒级时间戳，取模保证在 int 范围内
+        logger.info(f"未指定 seed，自动生成: {args.seed}")
+    else:
+        if args.seed < 0 or args.seed >= 2**31:
+            logger.error(f"seed 必须在 [0, {2**31}) 范围内")
+            return
+        logger.info(f"使用指定 seed: {args.seed}")
+
+    # 设置所有随机种子
+    import random
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    # 进一步减少 CUDA 非确定性
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     # 获取训练脚本配置
     script_config = get_train_script_config(args.train_script)
     if script_config is None:
         logger.error(f"未知的训练脚本: {args.train_script}")
         return
 
-    # train_onReal 不支持 mixed 模式，默认设为 cffa
-    if args.train_script == 'train_onReal' and args.train_mode == 'mixed':
-        logger.warning("train_onReal 不支持 mixed 模式，默认使用 cffa")
+    # train_onReal 和 train_onGen_vessels_enhanced 不支持 mixed 模式，默认设为 cffa
+    if args.train_script in ['train_onReal', 'train_onGen_vessels_enhanced'] and args.train_mode == 'mixed':
+        logger.warning(f"{args.train_script} 不支持 mixed 模式，默认使用 cffa")
         args.train_mode = 'cffa'
 
     # 动态导入模块
@@ -792,7 +839,7 @@ def main():
         logger.info(f"指定测试数据集: {test_datasets}")
     else:
         # 未显式指定时，根据 train_mode 选择默认测试集
-        if args.train_script in ['train_onGen', 'train_onReal']:
+        if args.train_script in ['train_onGen', 'train_onReal', 'train_onGen_vessels_enhanced']:
             mode2datasets = {
                 'cffa': ['CFFA'],
                 'cfoct': ['CFOCT'],
@@ -803,7 +850,7 @@ def main():
             logger.info(f"根据 train_mode 自动选择测试数据集: {test_datasets}")
         # 对于 MultiGen 混合训练脚本，保持默认行为（全部数据集），除非用户用 -d 显式指定
 
-    test_dataloader = test_dm.get_test_dataloader(datasets=test_datasets)
+    test_dataloader = test_dm.get_test_dataloader(datasets=test_datasets, seed=args.seed)
 
     logger.info(f"开始测试 (训练脚本: {args.train_script} | 模型: {args.name})")
 
@@ -827,6 +874,7 @@ def main():
         if args.train_script == 'train_onGen':
             f.write(f"Train Mode: {args.train_mode}\n")
         f.write(f"Test Name: {args.test_name}\n")
+        f.write(f"Seed: {args.seed}\n")
         f.write(f"Model Name: {args.name}\n")
         if args.test_datasets:
             f.write(f"Test Datasets: {args.test_datasets}\n")
